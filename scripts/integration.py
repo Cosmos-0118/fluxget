@@ -141,7 +141,7 @@ class Downloads(unittest.TestCase):
 
     def interrupt(self):
         url = self.server.url + "/file.bin?size=8388608&cap=2"
-        process = subprocess.Popen([str(BINARY), url, "-o", str(self.output), "--direct", "--chunk-kib", "256", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen([str(BINARY), url, "-o", str(self.output), "--direct", "--chunk-kib", "256", "-j", "1", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         cp_path = Path(str(self.output) + ".fluxget.json")
         deadline = time.monotonic() + 15
         try:
@@ -181,7 +181,7 @@ class Downloads(unittest.TestCase):
 
     def test_exclusive_output_lock(self):
         # Keep the first process alive until a competing process attempts the same output.
-        process = subprocess.Popen([str(BINARY), self.server.url + "/file.bin?size=8388608&cap=1", "-o", str(self.output), "--direct", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen([str(BINARY), self.server.url + "/file.bin?size=8388608&cap=1", "-o", str(self.output), "--direct", "-j", "1", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 10
             while not Path(str(self.output) + ".fluxget.json").exists() and time.monotonic() < deadline:

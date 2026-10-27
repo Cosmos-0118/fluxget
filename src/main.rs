@@ -1,13 +1,19 @@
+mod backends;
 mod engine;
+mod forges;
 mod http;
 mod picker;
 mod resolver;
 mod sites;
 mod state;
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use std::{ffi::OsString, path::PathBuf, process::Command};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Parser)]
 #[command(
@@ -21,7 +27,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Download a file, or choose a detected page download with arrow keys
+    /// Download a file, or choose a detected page download with arrow keys.
+    /// Understands GitHub/GitLab/Codeberg releases, Hugging Face, archive.org,
+    /// SourceForge, Drive/Dropbox/OneDrive links, torrents and media pages
     Get(Download),
     /// Resume using the checkpoint beside an output file
     Resume {
@@ -75,7 +83,7 @@ pub struct Network {
 #[derive(Args, Clone)]
 pub struct Tuning {
     /// Maximum simultaneous range requests (auto starts at two)
-    #[arg(short = 'j', long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+    #[arg(short = 'j', long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=32))]
     connections: u8,
     /// Fixed connection count; otherwise adapt based on measured throughput
     #[arg(long)]
@@ -99,9 +107,14 @@ pub struct Tuning {
 
 #[derive(Args)]
 struct Download {
+    /// Page, file or release URL; a magnet link; or a local .torrent file
     url: String,
+    /// Output file. For torrents and media pages: the output directory
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Minutes to keep seeding after a torrent completes (0 stops immediately)
+    #[arg(long, default_value_t = 0)]
+    seed_minutes: u32,
     /// Expected SHA-256; checked before publishing the completed output
     #[arg(long, value_parser = checksum)]
     sha256: Option<String>,
@@ -131,15 +144,14 @@ fn checksum(value: &str) -> Result<String, String> {
     }
 }
 
-fn external(program: &str, args: &[OsString]) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .status()
-        .with_context(|| format!("Install {program} and add it to PATH; run 'fluxget doctor'"))?;
-    if !status.success() {
-        bail!("{program} exited with {status}");
-    }
-    Ok(())
+/// A bare argument that names something downloadable implies the `get` command.
+fn implies_get(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("magnet:")
+        || (lower.ends_with(".torrent") && Path::new(arg).is_file())
+        || http::normalize(arg) != arg
 }
 
 #[tokio::main]
@@ -152,18 +164,24 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().collect();
-    if args.get(1).is_some_and(|s| {
-        s.to_string_lossy().starts_with("https://") || s.to_string_lossy().starts_with("http://")
-    }) {
+    if args
+        .get(1)
+        .is_some_and(|s| implies_get(&s.to_string_lossy()))
+    {
         args.insert(1, "get".into());
     }
     match Cli::parse_from(args).command {
         Action::Get(d) => {
             let client = http::client(&d.network)?;
-            let url = if d.direct {
-                http::valid_url(&d.url)?
+            let target = if d.direct {
+                resolver::Target {
+                    kind: resolver::Kind::Http,
+                    url: http::valid_url(&d.url)?.to_string(),
+                    sha256: None,
+                    info: None,
+                }
             } else {
-                let Some(url) = resolver::select(
+                let Some(target) = resolver::select(
                     &client,
                     &d.url,
                     d.selection.map(usize::from),
@@ -175,11 +193,40 @@ async fn run() -> Result<()> {
                     eprintln!("Cancelled; no download started.");
                     return Ok(());
                 };
-                url
+                target
             };
-            let info = http::probe(&client, url, d.tuning.retries).await?;
-            let output = d.output.unwrap_or_else(|| PathBuf::from(&info.filename));
-            engine::download(client, info, output, d.sha256, d.force, &d.tuning).await?;
+            match target.kind {
+                resolver::Kind::Torrent => {
+                    backends::torrent(
+                        &client,
+                        &target.url,
+                        d.output.as_deref(),
+                        d.seed_minutes,
+                        d.tuning.quiet,
+                        d.tuning.json,
+                    )
+                    .await?
+                }
+                resolver::Kind::Media => backends::media(
+                    &target.url,
+                    d.output.as_deref(),
+                    &d.network,
+                    d.tuning.quiet,
+                    d.tuning.json,
+                )?,
+                resolver::Kind::Http => {
+                    let info = match target.info {
+                        Some(info) => info,
+                        None => {
+                            let url = http::valid_url(&target.url)?;
+                            http::probe(&client, url, d.tuning.retries).await?
+                        }
+                    };
+                    let output = d.output.unwrap_or_else(|| PathBuf::from(&info.filename));
+                    let expected = d.sha256.or(target.sha256);
+                    engine::download(client, info, output, expected, d.force, &d.tuning).await?;
+                }
+            }
         }
         Action::Resume {
             output,
@@ -232,8 +279,8 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        Action::Aria2 { args } => external("aria2c", &args)?,
-        Action::Media { args } => external("yt-dlp", &args)?,
+        Action::Aria2 { args } => backends::run("aria2c", &args, false)?,
+        Action::Media { args } => backends::run("yt-dlp", &args, false)?,
     }
     Ok(())
 }

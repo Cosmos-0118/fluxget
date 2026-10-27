@@ -12,6 +12,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
@@ -30,51 +34,80 @@ struct Summary {
     concurrency_changes: usize,
 }
 
-/// Additive exploration, rollback on no gain, multiplicative decrease on throttle.
+/// Fast multiplicative ramp-up while throughput keeps improving, rollback and a
+/// pause when it does not, multiplicative decrease on throttling. Samples count
+/// bytes as they arrive, not only finished chunks, so they are not quantized.
 struct Controller {
     target: usize,
     max: usize,
     fixed: bool,
     last_rate: Option<f64>,
+    before_growth: usize,
+    strikes: u8,
     hold: u8,
     changes: usize,
     peak: usize,
 }
 
+/// Samples to skip after a change: new connections need time to ramp up.
+const SETTLE_SAMPLES: u8 = 1;
+/// Samples to wait after a plateau before probing for more throughput again.
+const PLATEAU_SAMPLES: u8 = 10;
+
 impl Controller {
     fn new(t: &Tuning) -> Self {
         let max = t.connections as usize;
-        let target = if t.fixed { max } else { max.min(2) };
+        let target = if t.fixed { max } else { max.min(4) };
         Self {
             target,
             max,
             fixed: t.fixed,
             last_rate: None,
+            before_growth: target,
+            strikes: 0,
             hold: 0,
             changes: 0,
             peak: target,
         }
     }
-    fn update(&mut self, rate: f64, throttled: bool) {
+    fn grow(&mut self) {
+        self.before_growth = self.target;
+        self.target = (self.target + (self.target / 2).max(1)).min(self.max);
+        self.hold = SETTLE_SAMPLES;
+    }
+    fn throttled(&mut self) {
         let previous = self.target;
-        if throttled {
-            self.target = (self.target / 2).max(1);
-            self.last_rate = None;
-            self.hold = 3;
-        } else if !self.fixed && rate > 0.0 {
-            if self.hold > 0 {
-                self.hold -= 1;
-            } else if self.last_rate.is_none_or(|last| rate > last * 1.05) {
-                if self.target < self.max {
-                    self.target += 1;
-                }
-                self.last_rate = Some(rate);
-            } else {
-                self.target = self.target.saturating_sub(1).max(1);
+        self.target = (self.target / 2).max(1);
+        self.last_rate = None;
+        self.hold = 3;
+        self.record(previous);
+    }
+    fn sample(&mut self, rate: f64) {
+        if self.fixed || rate <= 0.0 {
+            return;
+        }
+        let previous = self.target;
+        if self.hold > 0 {
+            self.hold -= 1;
+        } else if self.last_rate.is_none_or(|last| rate > last * 1.10) {
+            self.strikes = 0;
+            self.last_rate = Some(rate);
+            if self.target < self.max {
+                self.grow();
+            }
+        } else {
+            // One flat sample may be noise; two in a row is a plateau.
+            self.strikes += 1;
+            if self.strikes >= 2 {
+                self.strikes = 0;
+                self.target = self.before_growth.min(self.target).max(1);
                 self.last_rate = None;
-                self.hold = 3;
+                self.hold = PLATEAU_SAMPLES;
             }
         }
+        self.record(previous);
+    }
+    fn record(&mut self, previous: usize) {
         if previous != self.target {
             self.changes += 1;
         }
@@ -88,6 +121,7 @@ async fn fetch_chunk(
     index: usize,
     chunk_size: u64,
     retries: u8,
+    received: Arc<AtomicU64>,
 ) -> Result<(usize, Vec<u8>, bool)> {
     let size = info.size.context("Range download requires size")?;
     let start = index as u64 * chunk_size;
@@ -131,6 +165,7 @@ async fn fetch_chunk(
                         "Range body exceeds requested size"
                     );
                     data.extend_from_slice(&bytes);
+                    received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -142,6 +177,7 @@ async fn fetch_chunk(
         if body_error.is_none() && data.len() == expected {
             return Ok((index, data, throttled));
         }
+        received.fetch_sub(data.len() as u64, Ordering::Relaxed);
         if attempt == retries {
             bail!("Range {start}-{end} truncated after retries ({} of {expected} bytes): {body_error:?}", data.len());
         }
@@ -189,46 +225,103 @@ async fn segmented(
         .collect();
     let mut tasks = JoinSet::new();
     let mut controller = Controller::new(tuning);
+    let received = Arc::new(AtomicU64::new(0));
     let mut sample_start = Instant::now();
     let mut sample_bytes = 0u64;
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Chunks written but not yet synced; the journal only claims synced data.
+    let mut unsynced: Vec<(usize, String)> = Vec::new();
+    let mut last_flush = Instant::now();
     let cancel = tokio::signal::ctrl_c();
     tokio::pin!(cancel);
     while !queue.is_empty() || !tasks.is_empty() {
-        while tasks.len() < controller.target {
-            let Some(index) = queue.pop_front() else {
-                break;
-            };
-            tasks.spawn(fetch_chunk(
-                client.clone(),
-                info.clone(),
-                index,
-                state.chunk_size,
-                tuning.retries,
-            ));
-        }
+        refill(
+            &mut tasks,
+            &mut queue,
+            &controller,
+            client,
+            info,
+            state,
+            tuning,
+            &received,
+        );
         tokio::select! {
-            _ = &mut cancel => bail!("Interrupted; run 'fluxget resume <output>' to continue"),
-            result = tasks.join_next() => {
+            _ = &mut cancel => {
+                flush(file, checkpoint_path, state, &mut unsynced)?;
+                bail!("Interrupted; run 'fluxget resume <output>' to continue")
+            }
+            _ = ticker.tick() => {
+                let seen = received.load(Ordering::Relaxed);
+                let elapsed = sample_start.elapsed().as_secs_f64();
+                controller.sample(seen.saturating_sub(sample_bytes) as f64 / elapsed.max(0.001));
+                sample_bytes = seen;
+                sample_start = Instant::now();
+                progress.set_message(format!("{} workers", controller.target));
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
                 let (index, bytes, throttled) = result.context("No worker result")?? ?;
+                if throttled {
+                    controller.throttled();
+                }
+                // Start the replacement request before touching the disk.
+                refill(&mut tasks, &mut queue, &controller, client, info, state, tuning, &received);
                 file.seek(SeekFrom::Start(index as u64 * state.chunk_size))?;
                 file.write_all(&bytes)?;
-                // Data reaches stable storage before we claim this chunk in the journal.
-                file.sync_data()?;
-                state.chunks[index] = Some(state::hash(&bytes));
-                state::save(checkpoint_path, state)?;
+                unsynced.push((index, state::hash(&bytes)));
                 progress.inc(bytes.len() as u64);
-                sample_bytes += bytes.len() as u64;
-                let elapsed = sample_start.elapsed().as_secs_f64();
-                if throttled || elapsed >= 0.75 {
-                    controller.update(sample_bytes as f64 / elapsed.max(0.001), throttled);
-                    progress.set_message(format!("{} workers", controller.target));
-                    sample_start = Instant::now();
-                    sample_bytes = 0;
+                if last_flush.elapsed() >= Duration::from_secs(1) {
+                    flush(file, checkpoint_path, state, &mut unsynced)?;
+                    last_flush = Instant::now();
                 }
             }
         }
     }
+    flush(file, checkpoint_path, state, &mut unsynced)?;
     Ok((resumed, controller))
+}
+
+/// Data reaches stable storage before the journal claims it.
+fn flush(
+    file: &File,
+    checkpoint_path: &Path,
+    state: &mut Checkpoint,
+    unsynced: &mut Vec<(usize, String)>,
+) -> Result<()> {
+    if unsynced.is_empty() {
+        return Ok(());
+    }
+    file.sync_data()?;
+    for (index, hash) in unsynced.drain(..) {
+        state.chunks[index] = Some(hash);
+    }
+    state::save(checkpoint_path, state)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refill(
+    tasks: &mut JoinSet<Result<(usize, Vec<u8>, bool)>>,
+    queue: &mut VecDeque<usize>,
+    controller: &Controller,
+    client: &Client,
+    info: &Info,
+    state: &Checkpoint,
+    tuning: &Tuning,
+    received: &Arc<AtomicU64>,
+) {
+    while tasks.len() < controller.target {
+        let Some(index) = queue.pop_front() else {
+            break;
+        };
+        tasks.spawn(fetch_chunk(
+            client.clone(),
+            info.clone(),
+            index,
+            state.chunk_size,
+            tuning.retries,
+            received.clone(),
+        ));
+    }
 }
 
 async fn single(
@@ -453,28 +546,65 @@ pub async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn adaptive_caps_and_throttle() {
-        let t = Tuning {
-            connections: 8,
-            fixed: false,
+    fn tuning(connections: u8, fixed: bool) -> Tuning {
+        Tuning {
+            connections,
+            fixed,
             single_stream: false,
             chunk_kib: 2048,
             retries: 4,
             json: false,
             quiet: true,
-        };
-        let mut c = Controller::new(&t);
-        c.update(100.0, false);
-        assert_eq!(c.target, 3);
-        c.update(101.0, false);
+        }
+    }
+    #[test]
+    fn ramps_quickly_while_throughput_improves() {
+        let mut c = Controller::new(&tuning(16, false));
+        assert_eq!(c.target, 4);
+        c.sample(100.0);
+        assert_eq!(c.target, 6);
+        c.sample(100.0); // settling sample is ignored
+        assert_eq!(c.target, 6);
+        c.sample(150.0);
+        assert_eq!(c.target, 9);
+        c.sample(150.0);
+        c.sample(220.0);
+        assert_eq!(c.target, 13);
+        c.sample(220.0);
+        c.sample(320.0);
+        assert_eq!(c.target, 16);
+    }
+    #[test]
+    fn plateau_rolls_back_then_probes_again() {
+        let mut c = Controller::new(&tuning(16, false));
+        c.sample(100.0);
+        c.sample(100.0);
+        c.sample(102.0); // 4 -> 6 gave no gain: first strike only
+        assert_eq!(c.target, 6);
+        c.sample(103.0);
+        assert_eq!(c.target, 4);
+        for _ in 0..PLATEAU_SAMPLES {
+            c.sample(100.0);
+            assert_eq!(c.target, 4);
+        }
+        c.sample(100.0);
+        assert_eq!(c.target, 6);
+    }
+    #[test]
+    fn throttle_halves_and_bounds_hold() {
+        let mut c = Controller::new(&tuning(8, false));
+        c.throttled();
         assert_eq!(c.target, 2);
-        c.update(100.0, true);
+        c.throttled();
+        c.throttled();
         assert_eq!(c.target, 1);
-        for n in 1..100 {
-            c.update(n as f64 * 100.0, false);
+        for n in 1..200 {
+            c.sample(n as f64 * 100.0);
             assert!((1..=8).contains(&c.target));
         }
+        let mut fixed = Controller::new(&tuning(8, true));
+        fixed.sample(1.0);
+        assert_eq!(fixed.target, 8);
     }
     #[test]
     fn damaged_chunk_is_redownloaded() {

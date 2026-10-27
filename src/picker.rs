@@ -1,4 +1,7 @@
-use crate::resolver::Candidate;
+use crate::{
+    resolver::{Candidate, Kind},
+    sites,
+};
 use anyhow::{bail, ensure, Result};
 use dialoguer::{theme::ColorfulTheme, Select};
 use std::io::{self, IsTerminal};
@@ -19,15 +22,21 @@ pub fn plain(value: &str) -> String {
 
 fn score(candidate: &Candidate) -> i32 {
     let text = format!("{} {}", candidate.label, candidate.url).to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    let windows = has(&[
+        "windows", "win32", "win64", "-win-", "_win_", "msvc", ".exe", ".msi", ".msix",
+    ]);
+    let macos = has(&["macos", "darwin", "mac ", "osx", "apple", ".dmg", ".pkg"]);
+    let linux = has(&["linux", ".appimage", ".deb", ".rpm", ".snap"]);
     let os_match = match std::env::consts::OS {
-        "windows" => text.contains("windows") || text.contains("win32"),
-        "macos" => text.contains("macos") || text.contains("darwin") || text.contains("mac "),
-        "linux" => text.contains("linux"),
+        "windows" => windows,
+        "macos" => macos,
+        "linux" => linux,
         _ => false,
     };
     let mut score = if os_match { 10 } else { 0 };
-    let arm = text.contains("arm64") || text.contains("aarch64");
-    let x64 = text.contains("x64") || text.contains("x86_64") || text.contains("amd64");
+    let arm = has(&["arm64", "aarch64", "armv8"]);
+    let x64 = has(&["x64", "x86_64", "amd64", "win64", "x86-64"]);
     if (std::env::consts::ARCH == "aarch64" && arm) || (std::env::consts::ARCH == "x86_64" && x64) {
         score += 3;
     }
@@ -40,7 +49,39 @@ fn score(candidate: &Candidate) -> i32 {
     if text.contains("cli") {
         score -= 2;
     }
+    // Checksums, signatures and source archives are rarely what was wanted.
+    if has(&[
+        ".sha256",
+        ".sha512",
+        ".sha1",
+        ".md5",
+        "checksum",
+        "sha256sum",
+        ".sig",
+        ".asc",
+        ".minisig",
+        ".sbom",
+        ".pem",
+        ".sigstore",
+    ]) {
+        score -= 8;
+    }
+    if has(&["source code", ".src."]) {
+        score -= 5;
+    }
     score
+}
+
+/// What to show beside a candidate: its host, or the tool that will fetch it.
+fn origin_tag(candidate: &Candidate) -> String {
+    match candidate.kind {
+        Kind::Torrent => "torrent".into(),
+        Kind::Media => "media".into(),
+        Kind::Http => url::Url::parse(&candidate.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default(),
+    }
 }
 
 pub fn choose(
@@ -68,7 +109,15 @@ pub fn choose(
         let choices = links
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("  {}. {}\n     {}", i + 1, plain(&c.label), c.url))
+            .map(|(i, c)| {
+                let tag = origin_tag(c);
+                format!(
+                    "  {}. {} [{tag}]\n     {}",
+                    i + 1,
+                    plain(&c.label),
+                    sites::short(&c.url)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         bail!("Found {} downloads. Use --select N to choose one without a terminal, or 'fluxget resolve URL' for JSON.\n{choices}", links.len());
@@ -84,11 +133,7 @@ pub fn choose(
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let host = url::Url::parse(&c.url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_owned))
-                .unwrap_or_default();
-            let text = format!("{:>3}. {}  [{}]", i + 1, plain(&c.label), host);
+            let text = format!("{:>3}. {}  [{}]", i + 1, plain(&c.label), origin_tag(c));
             dialoguer::console::truncate_str(&text, width.saturating_sub(6), "...").into_owned()
         })
         .collect::<Vec<_>>();
@@ -107,7 +152,7 @@ pub fn choose(
         eprintln!(
             "Selected: {}\n{}",
             plain(&links[index].label),
-            links[index].url
+            sites::short(&links[index].url)
         );
     }
     Ok(choice)
@@ -121,16 +166,35 @@ mod tests {
         assert!(!plain("file\x1b[2J\u{202e}evil\nname").contains(['\x1b', '\u{202e}', '\n']));
     }
     #[test]
+    fn default_choice_prefers_the_installer_over_checksums_and_source() {
+        let installer = Candidate::new(
+            "https://h.example/tool-1.0-x86_64-pc-windows-msvc.zip",
+            "tool windows x64",
+        );
+        let checksum = Candidate::new(
+            "https://h.example/tool-1.0-x86_64-pc-windows-msvc.zip.sha256",
+            "tool windows x64 checksum",
+        );
+        let source = Candidate::new("https://h.example/v1.0.zip", "Source code (zip)");
+        let linux = Candidate::new("https://h.example/tool-linux.tar.gz", "tool linux");
+        assert!(score(&installer) > score(&checksum));
+        assert!(score(&installer) > score(&source));
+        if std::env::consts::OS == "windows" {
+            assert!(score(&installer) > score(&linux));
+        }
+        assert_eq!(
+            origin_tag(&Candidate::new(
+                "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a",
+                "m"
+            )),
+            "torrent"
+        );
+    }
+    #[test]
     fn headless_selection_is_explicit_and_bounded() {
         let links = vec![
-            Candidate {
-                url: "https://example.com/a.zip".into(),
-                label: "A".into(),
-            },
-            Candidate {
-                url: "https://example.com/b.zip".into(),
-                label: "B".into(),
-            },
+            Candidate::new("https://example.com/a.zip", "A"),
+            Candidate::new("https://example.com/b.zip", "B"),
         ];
         assert_eq!(choose(&links, Some(2), false, true).unwrap(), Some(1));
         assert!(choose(&links, Some(0), false, true).is_err());

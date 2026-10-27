@@ -376,11 +376,13 @@ name = "fluxget"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "dialoguer",
  "fs2",
  "httpdate",
  "indicatif",
+ "percent-encoding",
  "reqwest",
  "scraper",
  "serde",

@@ -60,3 +60,40 @@ The portable aria2 downloaded for local measurement stays in this task's work
 folder, with its upstream license; its ZIP SHA-256 is
 `67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288`.
 
+
+## What people download in a browser, and how each is supported
+
+Recorded 2026-10-27 from the public sites themselves (live API responses checked
+the same day), not from usage statistics. Browser downloads fall into a few
+groups; each has a different obstacle for a command-line downloader.
+
+| Group | Typical sites | Obstacle | Decision |
+|---|---|---|---|
+| Software releases | GitHub, GitLab, Codeberg, SourceForge, vendor pages | Assets are loaded by script; pages list source archives and checksums beside installers | Use each site's public release API (exact names, sizes, SHA-256 digests); fall back to GitHub's asset fragment when the API rate limit is hit |
+| Models and datasets | Hugging Face | Repositories hold many large files; LFS objects are addressed by SHA-256 | Tree API listing; verify LFS SHA-256 automatically |
+| Archives and media libraries | archive.org | Items hold originals plus derived files and internal metadata | Metadata API; originals first, internal files hidden |
+| Cloud shares | Google Drive/Docs, Dropbox, OneDrive, Pixeldrain | Share pages are not the file | Rewrite to the documented direct form; MEGA is encrypted end to end and is refused with an explanation |
+| Torrents | Index pages with magnet links and `.torrent` files, trackers | Different protocol (peers, DHT, piece hashes) | Detect magnet/torrent links in pages; delegate to aria2 instead of reimplementing BitTorrent |
+| Video and audio | YouTube, Vimeo, X, Instagram, TikTok, Reddit, Twitch, SoundCloud | Per-site extractors that change weekly | Recognise media page URLs; delegate to yt-dlp |
+| Generic files | Direct links, mirrors, "your download will start" pages | Redirects, meta refresh, obfuscated buttons | Static HTML heuristics only |
+
+Not attempted: login-gated sites and JavaScript-rendered listings (torrent search
+results, single-page download sites). A native BitTorrent engine was not added:
+aria2 is mature, and verifying a from-scratch peer protocol would need swarm
+testing that a loopback fixture cannot provide. Digest verification relies on
+the publisher: a compromised release API could supply a matching bad digest.
+
+## Measured download speed (2026-10-27, Windows 11)
+
+The VS Code user installer (249 MB) completed in about 11.5 s with curl, the old
+fluxget and the new fluxget alike on a steady connection, limited by the link
+(about 21 MB/s). Earlier in the session the same CDN briefly throttled single
+connections to about 2 MB/s; in that state a 16-worker transfer finished in 14.6 s
+while the old adaptive controller needed 38 s. Two engine causes were fixed:
+the controller started at two workers and judged throughput from whole completed
+chunks, and the coordinator synced and rewrote the checkpoint after every chunk
+before starting the next request. On the loopback fixture the new engine
+completes an unthrottled 256 MiB transfer in 0.44 s versus 0.90 s. Landing-page
+resolution for code.visualstudio.com fell from 0.6-5.9 s to 8 ms, because the
+adapter now knows all 25 builds and needs no page fetch. Resolution latency, not
+transfer speed, is what the old binary spent extra seconds on.

@@ -8,8 +8,28 @@ use serde::Serialize;
 use std::time::{Duration, SystemTime};
 use url::Url;
 
+/// Accept pasted `example.com/path` by assuming HTTPS; everything else is left alone.
+pub fn normalize(raw: &str) -> String {
+    let raw = raw.trim();
+    let host = raw.split(['/', '?', '#']).next().unwrap_or("");
+    let looks_like_host = (host.contains('.') || host.starts_with("localhost"))
+        && !host.contains(char::is_whitespace)
+        && host.starts_with(|c: char| c.is_ascii_alphanumeric());
+    // Local development servers rarely have TLS; everything else defaults to HTTPS.
+    let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    let local = name == "localhost"
+        || name
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !raw.contains("://") && !raw.starts_with("magnet:") && looks_like_host {
+        format!("{}://{raw}", if local { "http" } else { "https" })
+    } else {
+        raw.to_owned()
+    }
+}
+
 pub fn valid_url(raw: &str) -> Result<Url> {
-    let url = Url::parse(raw).context("Expected an absolute HTTP(S) URL")?;
+    let url = Url::parse(&normalize(raw)).context("Expected an absolute HTTP(S) URL")?;
     ensure!(
         matches!(url.scheme(), "http" | "https"),
         "Native engine supports HTTP(S); use 'fluxget aria2' for other protocols"
@@ -164,9 +184,55 @@ pub async fn request(builder: reqwest::RequestBuilder, retries: u8) -> Result<(R
     bail!("Retry budget exhausted")
 }
 
+pub fn html_type(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("text/html") || value.contains("application/xhtml+xml")
+}
+
+pub const PAGE_LIMIT: usize = 2 * 1024 * 1024;
+
+pub enum Fetched {
+    File(Info),
+    Page { url: Url, body: String },
+}
+
+/// One request that serves as both range probe and landing-page fetch: HTML
+/// servers ignore the range and return the page, files answer with one byte.
+pub async fn fetch(client: &Client, url: Url, retries: u8) -> Result<Fetched> {
+    let (response, _) = request(client.get(url).header("range", "bytes=0-0"), retries).await?;
+    if !html_type(header(&response, "content-type").unwrap_or("")) {
+        return Ok(Fetched::File(probe_response(response).await?));
+    }
+    let mut response = if response.status() == StatusCode::PARTIAL_CONTENT {
+        // A static HTML file honored the range; fetch the whole document.
+        let url = response.url().clone();
+        drop(response);
+        request(client.get(url), retries).await?.0
+    } else {
+        response
+    };
+    let url = response.url().clone();
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            data.len() + chunk.len() <= PAGE_LIMIT,
+            "HTML page exceeds 2 MiB resolver limit; use --direct to save it"
+        );
+        data.extend_from_slice(&chunk);
+    }
+    Ok(Fetched::Page {
+        url,
+        body: String::from_utf8_lossy(&data).into_owned(),
+    })
+}
+
 pub async fn probe(client: &Client, url: Url, retries: u8) -> Result<Info> {
     // A GET range probe establishes real support; Accept-Ranges and HEAD can lie.
-    let (mut response, _) = request(client.get(url).header("range", "bytes=0-0"), retries).await?;
+    let (response, _) = request(client.get(url).header("range", "bytes=0-0"), retries).await?;
+    probe_response(response).await
+}
+
+async fn probe_response(mut response: Response) -> Result<Info> {
     if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
         && header(&response, "content-range") == Some("bytes */0")
     {
@@ -267,6 +333,19 @@ mod tests {
         ] {
             assert!(range(bad).is_err());
         }
+    }
+    #[test]
+    fn pasted_hosts_get_a_scheme() {
+        assert_eq!(normalize("github.com/o/r"), "https://github.com/o/r");
+        assert_eq!(normalize("127.0.0.1:8080/x"), "http://127.0.0.1:8080/x");
+        assert_eq!(normalize("localhost:3000"), "http://localhost:3000");
+        assert_eq!(normalize("https://a.example/x"), "https://a.example/x");
+        assert_eq!(
+            normalize("magnet:?xt=urn:btih:abc"),
+            "magnet:?xt=urn:btih:abc"
+        );
+        assert_eq!(normalize("--help"), "--help");
+        assert_eq!(normalize("resolve"), "resolve");
     }
     #[test]
     fn portable_filenames() {
