@@ -12,7 +12,7 @@ destination.mkdir(exist_ok=True)
 archive = destination / f"fluxget-{platform.system().lower()}-{platform.machine().lower()}.zip"
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as out:
     out.write(binary, binary.name)
-    for name in ["README.md", "LICENSE", "docs/RESEARCH.md", "docs/BENCHMARK_WINDOWS.md"]:
+    for name in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt", "docs/RESEARCH.md", "docs/BENCHMARK_WINDOWS.md", "docs/BENCHMARK_WINDOWS.json", "docs/VALIDATION_WINDOWS.md"]:
         if (root / name).exists():
             out.write(root / name, name)
 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
