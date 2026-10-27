@@ -1,6 +1,6 @@
 [package]
 name = "fluxget"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Adaptive, integrity-first cross-platform download CLI"
@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+dialoguer = { version = "0.12", default-features = false }
 fs2 = "0.4"
 httpdate = "1"
 indicatif = "0.17"

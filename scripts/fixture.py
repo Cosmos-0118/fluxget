@@ -72,6 +72,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if route in ("/homepage", "/downloads"):
+            body = b'<a href="/downloads">Download options</a>' if route == "/homepage" else b'<a href="/file.bin?size=1024">Small file</a><a href="/other.zip?size=2048">Other file</a>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if route in ("/page", "/ambiguous"):
             body = b'<html><a href="/file.bin" download>Download</a>'
             if route == "/ambiguous":

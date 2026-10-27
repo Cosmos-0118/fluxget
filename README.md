@@ -4,7 +4,7 @@ An adaptive, integrity-first download accelerator for Windows, macOS, and Linux.
 Native Rust HTTP(S) engine; optional **aria2** and **yt-dlp** commands reuse mature
 open-source implementations for torrents, Metalink, FTP/SFTP and media websites.
 
-This is version **0.1.1**. Release packages are built and tested on Windows,
+This is version **0.2.0**. Release packages are built and tested on Windows,
 macOS (Apple Silicon and Intel), and Linux, for x86_64 and aarch64 where available.
 
 ## Install once, update with the same command
@@ -91,9 +91,31 @@ fluxget resume downloads/archive.zip
 ```
 
 Quote URLs containing `&` or shell special characters. `get URL` and bare `URL`
-are equivalent. Only a single unambiguous HTML download candidate is followed;
-use `resolve` to list alternatives and choose one explicitly. `--direct` saves
-the actual HTTP response, including HTML when desired.
+are equivalent. A page with multiple downloads opens an **arrow-key picker**:
+use **Up/Down**, **Enter** to download, or **Esc** to cancel. A likely OS/CPU match
+is highlighted; you can choose another platform. One candidate is selected
+automatically unless you add `--pick`. `--direct` saves the actual HTTP response,
+including HTML when desired.
+
+```sh
+fluxget https://code.visualstudio.com/
+fluxget https://example.org/downloads --pick
+fluxget resolve https://code.visualstudio.com/
+fluxget https://example.org/downloads --select 2 --json
+```
+
+The resolver detects file links, download attributes, query-string filenames and
+download URL attributes. It can follow up to three same-origin download indexes
+one level below the starting page, with a 2 MiB/page and 200-candidate limit.
+VS Code has a dedicated adapter for its platform-specific JavaScript buttons,
+using Microsoft's official download endpoints; the page scripts are not run.
+Other JavaScript-only sites may still need a direct URL or another adapter.
+This lists detected downloads, not every possible file hidden behind a website.
+
+For scripts, `resolve` returns JSON with stable 1-based ordering. Use `--select N`
+to choose a candidate. Non-interactive input and `--json` never open a picker;
+ambiguous pages return the numbered choices and an actionable error. A download
+landing page can be resolved further after selection, up to four page levels.
 
 ```sh
 fluxget https://example.org/file.iso -j 16
@@ -205,6 +227,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 python scripts/integration.py --binary target/release/fluxget
+python scripts/test_picker.py --binary target/release/fluxget
 python scripts/benchmark.py --binary target/release/fluxget --runs 3
 python scripts/package.py
 python scripts/test_installers.py
@@ -231,7 +254,8 @@ claimed. See [the recorded Windows results](docs/BENCHMARK_WINDOWS.md).
 
 Working now: native HTTP(S), redirects, public static HTML candidates, bounded
 dynamic chunk scheduling, adaptive/fixed workers, validated resume, integrity,
-progress/JSON output, proxies/headers and optional backend delegation.
+progress/JSON output, proxies/headers, arrow-key download selection, a VS Code
+page adapter and optional backend delegation.
 
 Future work: independent mirror identity proofs and native mirror striping,
 browser extension/native messaging, batch scheduling, aggregate rate limiting,

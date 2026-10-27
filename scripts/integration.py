@@ -124,6 +124,21 @@ class Downloads(unittest.TestCase):
         self.assertTrue(info["ranges"])
         self.assertEqual(info["size"], 2 * 1024 * 1024)
 
+    def test_headless_selection_downloads_chosen_file(self):
+        self.call(self.server.url + "/homepage", "--select", "2", "-o", self.output, "--json")
+        self.verify(2048)
+
+    def test_download_index_discovery(self):
+        candidates = json.loads(self.call("resolve", self.server.url + "/homepage").stdout)
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(candidates[1]["url"].endswith("/other.zip?size=2048"))
+
+    def test_headless_ambiguity_is_actionable(self):
+        result = self.call(self.server.url + "/ambiguous", "-o", self.output, "--json", success=False)
+        self.assertIn("--select N", result.stderr)
+        self.assertFalse(self.output.exists())
+        self.call(self.server.url + "/ambiguous", "--select", "3", "-o", self.output, "--json", success=False)
+
     def interrupt(self):
         url = self.server.url + "/file.bin?size=8388608&cap=2"
         process = subprocess.Popen([str(BINARY), url, "-o", str(self.output), "--direct", "--chunk-kib", "256", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)

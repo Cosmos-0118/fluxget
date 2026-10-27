@@ -1,6 +1,8 @@
 mod engine;
 mod http;
+mod picker;
 mod resolver;
+mod sites;
 mod state;
 
 use anyhow::{bail, Context, Result};
@@ -19,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Download a file or the single unambiguous download link on a page
+    /// Download a file, or choose a detected page download with arrow keys
     Get(Download),
     /// Resume using the checkpoint beside an output file
     Resume {
@@ -109,6 +111,12 @@ struct Download {
     /// Skip HTML link resolution (download the response itself)
     #[arg(long)]
     direct: bool,
+    /// Choose a 1-based candidate number; useful for scripts and --json
+    #[arg(long = "select", conflicts_with = "direct", value_parser = clap::value_parser!(u16).range(1..=200))]
+    selection: Option<u16>,
+    /// Show the arrow-key picker even when only one candidate is found
+    #[arg(long, conflicts_with = "direct")]
+    pick: bool,
     #[command(flatten)]
     network: Network,
     #[command(flatten)]
@@ -155,7 +163,19 @@ async fn run() -> Result<()> {
             let url = if d.direct {
                 http::valid_url(&d.url)?
             } else {
-                resolver::select(&client, &d.url).await?
+                let Some(url) = resolver::select(
+                    &client,
+                    &d.url,
+                    d.selection.map(usize::from),
+                    d.pick,
+                    d.tuning.json,
+                )
+                .await?
+                else {
+                    eprintln!("Cancelled; no download started.");
+                    return Ok(());
+                };
+                url
             };
             let info = http::probe(&client, url, d.tuning.retries).await?;
             let output = d.output.unwrap_or_else(|| PathBuf::from(&info.filename));
