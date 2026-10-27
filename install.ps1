@@ -60,8 +60,12 @@ if (-not $hasLocalPayload) {
         $payloadDir = Join-Path $downloadDir 'package'
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $payloadDir)
-        $options = @{ InstallDir = $InstallDir; NoModifyPath = $NoModifyPath }
-        & (Join-Path $payloadDir 'install.ps1') @options
+        # The pasted bootstrap works under Restricted execution policy; run the
+        # verified payload in a child with a process-only policy override too.
+        $childArguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $payloadDir 'install.ps1'), '-InstallDir', $InstallDir)
+        if ($NoModifyPath) { $childArguments += '-NoModifyPath' }
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @childArguments
+        if ($LASTEXITCODE -ne 0) { throw 'Release installer failed; see the error above.' }
         return
     } finally {
         Remove-Item -LiteralPath $downloadDir -Recurse -Force

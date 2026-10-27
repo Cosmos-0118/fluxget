@@ -4,7 +4,7 @@ An adaptive, integrity-first download accelerator for Windows, macOS, and Linux.
 Native Rust HTTP(S) engine; optional **aria2** and **yt-dlp** commands reuse mature
 open-source implementations for torrents, Metalink, FTP/SFTP and media websites.
 
-This is version **0.1.0**. Release packages are built and tested on Windows,
+This is version **0.1.1**. Release packages are built and tested on Windows,
 macOS (Apple Silicon and Intel), and Linux, for x86_64 and aarch64 where available.
 
 ## Install once, update with the same command

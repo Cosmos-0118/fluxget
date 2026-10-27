@@ -137,6 +137,16 @@ class Installers(unittest.TestCase):
         self.install(package, remote=remote, success=False)
         self.assertEqual(self.target.read_bytes(), b"old working installation")
 
+    @unittest.skipUnless(WINDOWS, "Windows execution policy check")
+    def test_pasted_installer_under_restricted_policy(self):
+        package, remote = self.host()
+        env = self.env.copy()
+        env.update(FLUXGET_TEST_SCRIPT=str(package / "install.ps1"), FLUXGET_TEST_PREFIX=str(self.install_root), FLUXGET_TEST_RELEASE_URL=remote)
+        code = '& ([scriptblock]::Create([IO.File]::ReadAllText($env:FLUXGET_TEST_SCRIPT))) -InstallDir $env:FLUXGET_TEST_PREFIX -NoModifyPath -ReleaseBaseUrl $env:FLUXGET_TEST_RELEASE_URL'
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Restricted", "-Command", code], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.target.is_file())
+
     @unittest.skipIf(WINDOWS, "Unix shell profile check")
     def test_shell_path_works_after_install(self):
         self.install()
