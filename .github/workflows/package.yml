@@ -1,0 +1,25 @@
+name: Build portable packages
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fluxget-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+

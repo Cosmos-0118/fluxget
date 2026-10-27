@@ -1,0 +1,27 @@
+[package]
+name = "fluxget"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Adaptive, integrity-first cross-platform download CLI"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+httpdate = "1"
+indicatif = "0.17"
+reqwest = { version = "=0.12.22", default-features = false, features = ["rustls-tls", "http2", "stream", "socks"] }
+scraper = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+url = "2"
+
+[profile.release]
+lto = "thin"
+strip = true
+

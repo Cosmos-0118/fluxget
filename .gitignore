@@ -1,0 +1,9 @@
+/target/
+/bench-results/
+/bin/
+/dist/
+*.fluxget.part
+*.fluxget.json
+*.fluxget.lock
+__pycache__/
+
