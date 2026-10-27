@@ -27,4 +27,6 @@ jobs:
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=.exe; else suffix=; fi
           python scripts/integration.py --binary "target/release/fluxget$suffix"
+      - run: python scripts/package.py
+      - run: python scripts/test_installers.py
 

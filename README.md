@@ -4,8 +4,64 @@ An adaptive, integrity-first download accelerator for Windows, macOS, and Linux.
 Native Rust HTTP(S) engine; optional **aria2** and **yt-dlp** commands reuse mature
 open-source implementations for torrents, Metalink, FTP/SFTP and media websites.
 
-This is version **0.1.0**. Windows is tested locally. CI is configured for all
-three platforms; macOS/Linux results are pending until those jobs actually run.
+This is version **0.1.0**. Release packages are built and tested on Windows,
+macOS (Apple Silicon and Intel), and Linux, for x86_64 and aarch64 where available.
+
+## Install once, update with the same command
+
+No Rust, Python, admin account, or compiler is required for prebuilt releases.
+The installer automatically selects your OS and CPU, downloads the latest
+release, checks its SHA-256, verifies the executable, and installs it for your
+user account. Open a new terminal after installation and run `fluxget --help`.
+
+**Windows — paste into PowerShell:**
+
+```powershell
+irm https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.ps1 | iex
+```
+
+**macOS or Linux — paste into Terminal:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.sh | bash
+```
+
+Prefer clicking? Download the matching ZIP from
+[Releases](https://github.com/Cosmos-0118/fluxget/releases/latest), extract it,
+then double-click **Install.cmd** on Windows or **Install.command** on macOS.
+If macOS blocks the unsigned installer, use the Terminal command above.
+Linux packages also include `install.sh`. Packages contain license notices and
+both an archive checksum and an internal executable checksum. Checksums detect
+corruption; they rely on the trusted GitHub release as the source.
+
+**Already installed? Run the same command again to update.** An identical binary
+is left in place; a changed binary replaces the existing installation only after
+verification. A failed download, checksum or version check leaves the old binary
+intact. PATH entries are not duplicated. Downloads and resume checkpoints are
+preserved; updating does not uninstall your data or create another installation.
+An explicitly selected older release can also replace the installed version.
+
+Default locations: `%LOCALAPPDATA%\Programs\fluxget\bin` on Windows and
+`~/.local/bin` on macOS/Linux. Windows updates the user PATH; Unix updates shell
+profiles for bash/zsh. Restart your terminal after installation or updates.
+Installation from an extracted archive uses that archive's version; the online
+command always fetches the latest published release.
+
+For a custom directory or a pinned version:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.ps1))) -Version v0.1.0 -InstallDir "$env:LOCALAPPDATA\Programs\fluxget"
+```
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.sh | bash -s -- --version v0.1.0 --prefix "$HOME/apps/fluxget"
+```
+
+Extracted-package options: `powershell -ExecutionPolicy Bypass -File install.ps1
+-InstallDir C:\Tools\fluxget -NoModifyPath` or `bash install.sh --prefix
+"$HOME/apps/fluxget" --no-modify-path`. The no-modify option leaves PATH/profile
+settings unchanged. Running an installer from a source checkout uses its local
+binary, or builds it if the prerequisites below are available.
 
 ## Build and install
 
@@ -56,6 +112,15 @@ throughput exploration; rate-limit responses can still reduce concurrency.
 This initial controller is a heuristic, not a proof of the optimal connection
 count. Small files can finish before it learns much. HTTP/2 multiplexes requests,
 so worker count is not necessarily TCP connection count.
+
+There is **no download-speed cap** in fluxget. Eight is the default worker
+ceiling, configurable with `-j` up to 32, for example `fluxget URL -j 32`.
+Files advertise byte-range support, not an optimal number of workers. The
+number of chunks bounds useful tasks; bandwidth, server limits, latency, CPU
+and disk determine whether extra workers improve throughput. A worker-per-chunk
+policy can open thousands of requests without adding bandwidth. The controller
+therefore measures performance within the chosen ceiling. Native aggregate
+bandwidth limiting is not implemented.
 
 `--chunk-kib` defaults to 2048 (allowed 64–16384). Application body buffers are
 bounded by maximum workers × chunk size, plus library buffers. Network retries
@@ -141,6 +206,8 @@ cargo test --locked
 cargo build --release --locked
 python scripts/integration.py --binary target/release/fluxget
 python scripts/benchmark.py --binary target/release/fluxget --runs 3
+python scripts/package.py
+python scripts/test_installers.py
 ```
 
 Append `.exe` to the binary path on Windows. `--aria2 /path/to/aria2c` adds the
@@ -150,6 +217,9 @@ Markdown table, into `bench-results/`. It uses a loopback fixture, deterministic
 content, randomized trial order, an untimed warm-up and SHA-256 verification of
 every result. Cases cover unrestricted transfers, synthetic per-connection caps,
 and servers ignoring ranges. Temporary payloads are removed automatically.
+
+Only the test server applies the synthetic per-connection cap. The downloader
+itself does not impose that cap; the unrestricted scenario has no rate limit.
 
 The measured outcome depends on file size, request latency, bandwidth policy,
 disk, checksum work, and checkpoint flush overhead. Loopback is not an internet

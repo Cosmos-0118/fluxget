@@ -65,7 +65,23 @@ pub fn save(path: &Path, state: &Checkpoint) -> Result<()> {
     serde_json::to_writer(temp.as_file_mut(), state)?;
     temp.as_file_mut().flush()?;
     temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
+    // On Windows an antivirus scanner or a checkpoint reader can briefly hold
+    // the old file without FILE_SHARE_DELETE. Retry the same atomic replacement;
+    // never remove the previous journal as a workaround.
+    for attempt in 0..=8 {
+        match temp.persist(path) {
+            Ok(_) => break,
+            Err(error)
+                if cfg!(windows)
+                    && matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                    && attempt < 8 =>
+            {
+                temp = error.file;
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+            }
+            Err(error) => return Err(error.error.into()),
+        }
+    }
     // On Unix also persist the directory entry. Windows replacement is atomic,
     // but power-loss durability still depends on the filesystem's rename policy.
     #[cfg(unix)]
@@ -110,4 +126,38 @@ pub fn validate_parts(file: &mut File, state: &mut Checkpoint) -> Result<u64> {
         }
     }
     Ok(verified)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn checkpoint_replacement_survives_temporary_readers() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("checkpoint.json");
+        let state = Checkpoint {
+            version: 1,
+            url: "https://example.com/file".into(),
+            size: 0,
+            etag: None,
+            expected_sha256: None,
+            chunk_size: 65536,
+            chunks: vec![],
+        };
+        save(&path, &state).unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&path)
+            .unwrap();
+        let reader_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(70));
+            drop(reader);
+        });
+        save(&path, &state).unwrap();
+        reader_thread.join().unwrap();
+        assert_eq!(load(&path).unwrap().version, 1);
+    }
 }

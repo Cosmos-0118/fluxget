@@ -131,6 +131,9 @@ class Downloads(unittest.TestCase):
         deadline = time.monotonic() + 15
         try:
             while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(f"Downloader exited before interruption: {stdout!r} {stderr!r}")
                 if cp_path.exists():
                     cp = json.loads(cp_path.read_text())
                     if sum(c is not None for c in cp["chunks"]) >= 3:
