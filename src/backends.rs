@@ -1,15 +1,24 @@
 //! Delegation to mature open-source tools for what the native HTTP engine does
 //! not do: BitTorrent (aria2) and video/audio sites (yt-dlp). Arguments are
 //! passed as a process argument vector; no shell command is ever constructed.
-use crate::{http, Network};
+use crate::{
+    http,
+    mediaui::{self, MediaTelemetry},
+    ui, Network,
+};
 use anyhow::{bail, ensure, Context, Result};
 use reqwest::Client;
 use serde::Serialize;
 use std::{
     ffi::OsString,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 #[derive(Serialize)]
@@ -29,19 +38,25 @@ pub fn run(program: &str, args: &[OsString], json: bool) -> Result<()> {
     if json {
         command.stdout(Stdio::from(std::io::stderr()));
     }
-    let name = match program {
-        "aria2c" => "aria2 (https://aria2.github.io/)",
-        "yt-dlp" => "yt-dlp (https://github.com/yt-dlp/yt-dlp)",
-        "winget" => "winget (the Windows Package Manager, included with Windows 10 and 11)",
-        other => other,
-    };
-    let status = command
-        .status()
-        .with_context(|| format!("Install {name} and add it to PATH; run 'fluxget doctor'"))?;
+    let status = command.status().with_context(|| {
+        format!(
+            "Install {} and add it to PATH; run 'fluxget doctor'",
+            program_name(program)
+        )
+    })?;
     if !status.success() {
         bail!("{program} exited with {status}");
     }
     Ok(())
+}
+
+fn program_name(program: &str) -> &str {
+    match program {
+        "aria2c" => "aria2 (https://aria2.github.io/)",
+        "yt-dlp" => "yt-dlp (https://github.com/yt-dlp/yt-dlp)",
+        "winget" => "winget (the Windows Package Manager, included with Windows 10 and 11)",
+        other => other,
+    }
 }
 
 fn directory(output: Option<&Path>) -> PathBuf {
@@ -179,8 +194,90 @@ fn parallel_args(aria2: bool, url: &str) -> Vec<OsString> {
     args
 }
 
-/// Download a video or audio page with yt-dlp (a single item, not a playlist).
-pub fn media(
+/// Lines kept from yt-dlp's standard error while the display covers the terminal.
+const KEPT_ERRORS: usize = 200;
+
+/// Runs yt-dlp with its output piped into the live display, and returns its exit status and
+/// everything it wrote to standard error. A Ctrl+C reaches yt-dlp too (same console); if it
+/// has not exited a few seconds later it is killed.
+async fn run_displayed(
+    args: &[OsString],
+    telemetry: Arc<MediaTelemetry>,
+) -> Result<(ExitStatus, Vec<String>, bool)> {
+    let mut command = Command::new("yt-dlp");
+    command
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Install {} and add it to PATH; run 'fluxget doctor'",
+            program_name("yt-dlp")
+        )
+    })?;
+    let stdout = child.stdout.take().context("yt-dlp gave no output")?;
+    let stderr = child.stderr.take().context("yt-dlp gave no error output")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let stop = stop.clone();
+        tokio::task::spawn_blocking(move || -> Result<(ExitStatus, Vec<String>)> {
+            let progress = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut line = Vec::new();
+                while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                    telemetry.feed(&String::from_utf8_lossy(&line));
+                    line.clear();
+                }
+            });
+            let errors = std::thread::spawn(move || {
+                let mut kept = Vec::new();
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
+                while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                    if kept.len() < KEPT_ERRORS {
+                        kept.push(String::from_utf8_lossy(&line).trim_end().to_owned());
+                    }
+                    line.clear();
+                }
+                kept
+            });
+            let mut stopped = None;
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if stop.load(Ordering::Relaxed) {
+                    let since = *stopped.get_or_insert_with(Instant::now);
+                    if since.elapsed() > Duration::from_secs(3) {
+                        let _ = child.kill();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let _ = progress.join();
+            Ok((status, errors.join().unwrap_or_default()))
+        })
+    };
+    tokio::pin!(worker);
+    let mut interrupted = false;
+    let cancel = tokio::signal::ctrl_c();
+    tokio::pin!(cancel);
+    let result = loop {
+        tokio::select! {
+            result = &mut worker => break result.context("yt-dlp monitor stopped")??,
+            _ = &mut cancel, if !interrupted => {
+                interrupted = true;
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+    };
+    Ok((result.0, result.1, interrupted))
+}
+
+/// Download a video or audio page with yt-dlp (a single item, not a playlist). In a terminal
+/// its output is replaced by the same live display plain downloads get.
+pub async fn media(
     url: &str,
     output: Option<&Path>,
     network: &Network,
@@ -207,9 +304,13 @@ pub fn media(
         args.push("--quiet".into());
         args.push("--no-warnings".into());
     }
+    let live = !quiet && !json && ui::interactive();
+    if live {
+        args.extend(mediaui::TEMPLATES.iter().map(OsString::from));
+    }
     args.push("--".into());
     args.push(url.into());
-    run("yt-dlp", &args, json).map_err(|error| {
+    let hint = |error: anyhow::Error| {
         if network.cookies_from_browser.is_some() {
             return error;
         }
@@ -218,8 +319,69 @@ pub fn media(
              'fluxget get --cookies-from-browser <chrome|firefox|safari|edge> <url>'; \
              'yt-dlp -U' or 'brew upgrade yt-dlp' also fixes many extraction errors",
         )
-    })?;
-    report("yt-dlp", "media", url, &dir, json)
+    };
+    if !live {
+        run("yt-dlp", &args, json).map_err(hint)?;
+        return report("yt-dlp", "media", url, &dir, json);
+    }
+    let source = url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.trim_start_matches("www.").to_owned())
+        })
+        .unwrap_or_else(|| "media".to_owned());
+    let telemetry = Arc::new(MediaTelemetry::new(source.clone()));
+    let started = Instant::now();
+    let display = {
+        let telemetry = telemetry.clone();
+        let mut state = ui::State::new();
+        ui::Display::spawn(move |rows, cols| mediaui::render(&telemetry, &mut state, rows, cols))
+    };
+    let outcome = run_displayed(&args, telemetry.clone()).await;
+    // Clear the display first, so what follows starts on a clean line.
+    drop(display);
+    let (status, errors, interrupted) = outcome.map_err(hint)?;
+    for line in errors.iter().filter(|l| !l.is_empty()) {
+        eprintln!("{line}");
+    }
+    if interrupted {
+        bail!("Interrupted; run the same command again to resume the partial download");
+    }
+    if !status.success() {
+        return Err(hint(anyhow::anyhow!("yt-dlp exited with {status}")));
+    }
+    let done = telemetry.snapshot();
+    let (bytes, _, received, resumed) = done.totals();
+    let elapsed = started.elapsed().as_secs_f64();
+    let title = done.title.clone().unwrap_or(source);
+    let place = done
+        .path
+        .clone()
+        .unwrap_or_else(|| dir.display().to_string());
+    let rate = if received > 0 {
+        format!(
+            "   {:.1} MiB/s",
+            received as f64 / 1048576.0 / elapsed.max(0.000001)
+        )
+    } else {
+        String::new()
+    };
+    let streams = match done.streams.len() {
+        0 | 1 => String::new(),
+        n => format!("   ·   {n} streams merged"),
+    };
+    let resumed = if resumed > 0 {
+        format!("   resumed {}", ui::bytes(resumed))
+    } else {
+        String::new()
+    };
+    println!(
+        "\n  \x1b[32m✔\x1b[0m  \x1b[1;97mDownloaded\x1b[0m  {title}\n     \x1b[90m{place}\x1b[0m\n     {} in {}{rate}{streams}{resumed}\n",
+        ui::bytes(bytes),
+        ui::duration(elapsed),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

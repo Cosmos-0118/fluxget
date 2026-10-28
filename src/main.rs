@@ -3,6 +3,7 @@ mod engine;
 mod forges;
 mod http;
 mod location;
+mod mediaui;
 mod paused;
 mod picker;
 mod resolver;
@@ -247,13 +248,16 @@ async fn run() -> Result<()> {
                     )
                     .await?
                 }
-                resolver::Kind::Media => backends::media(
-                    &target.url,
-                    d.output.as_deref().or(folder.as_deref()),
-                    &d.network,
-                    d.tuning.quiet,
-                    d.tuning.json,
-                )?,
+                resolver::Kind::Media => {
+                    backends::media(
+                        &target.url,
+                        d.output.as_deref().or(folder.as_deref()),
+                        &d.network,
+                        d.tuning.quiet,
+                        d.tuning.json,
+                    )
+                    .await?
+                }
                 resolver::Kind::Http => {
                     let info = match (target.info, pending) {
                         (Some(info), _) => info,

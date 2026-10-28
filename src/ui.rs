@@ -137,18 +137,18 @@ pub fn theme() -> ColorfulTheme {
     }
 }
 
-struct Palette {
-    dim: &'static str,
-    cyan: &'static str,
-    bright: &'static str,
-    white: &'static str,
-    green: &'static str,
-    bold: &'static str,
-    reset: &'static str,
+pub(crate) struct Palette {
+    pub(crate) dim: &'static str,
+    pub(crate) cyan: &'static str,
+    pub(crate) bright: &'static str,
+    pub(crate) white: &'static str,
+    pub(crate) green: &'static str,
+    pub(crate) bold: &'static str,
+    pub(crate) reset: &'static str,
 }
 
 impl Palette {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
             Self {
                 dim: "",
@@ -173,21 +173,21 @@ impl Palette {
     }
 }
 
-struct Glyphs {
-    full: char,
-    empty: char,
+pub(crate) struct Glyphs {
+    pub(crate) full: char,
+    pub(crate) empty: char,
     /// Left-aligned partial blocks, one eighth to seven eighths.
-    partial: [char; 7],
-    wave: [char; 8],
-    done: char,
-    flight: [char; 2],
-    some: char,
-    wait: char,
-    down: char,
+    pub(crate) partial: [char; 7],
+    pub(crate) wave: [char; 8],
+    pub(crate) done: char,
+    pub(crate) flight: [char; 2],
+    pub(crate) some: char,
+    pub(crate) wait: char,
+    pub(crate) down: char,
 }
 
 impl Glyphs {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         if std::env::var_os("FLUXGET_ASCII").is_some_and(|v| !v.is_empty()) {
             Self {
                 full: '#',
@@ -206,10 +206,10 @@ impl Glyphs {
                 empty: '░',
                 partial: ['▏', '▎', '▍', '▌', '▋', '▊', '▉'],
                 wave: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
-                done: '█',
-                flight: ['█', '▓'],
-                some: '▒',
-                wait: '░',
+                done: '■',
+                flight: ['■', '▪'],
+                some: '▪',
+                wait: '·',
                 down: '↓',
             }
         }
@@ -220,15 +220,15 @@ impl Glyphs {
 const WAVE: [usize; 16] = [4, 5, 6, 7, 7, 7, 6, 5, 4, 2, 1, 0, 0, 0, 1, 2];
 
 /// A line of styled text that never grows past the terminal width.
-struct Line {
-    text: String,
-    width: usize,
+pub(crate) struct Line {
+    pub(crate) text: String,
+    pub(crate) width: usize,
     max: usize,
     reset: &'static str,
 }
 
 impl Line {
-    fn new(max: usize, palette: &Palette) -> Self {
+    pub(crate) fn new(max: usize, palette: &Palette) -> Self {
         Self {
             text: String::new(),
             width: 0,
@@ -236,7 +236,7 @@ impl Line {
             reset: palette.reset,
         }
     }
-    fn put(&mut self, style: &str, text: &str) -> &mut Self {
+    pub(crate) fn put(&mut self, style: &str, text: &str) -> &mut Self {
         let room = self.max.saturating_sub(self.width);
         let shown: String = text.chars().take(room).collect();
         if !shown.is_empty() {
@@ -249,7 +249,7 @@ impl Line {
         }
         self
     }
-    fn gap(&mut self, n: usize) -> &mut Self {
+    pub(crate) fn gap(&mut self, n: usize) -> &mut Self {
         self.put("", &" ".repeat(n))
     }
 }
@@ -280,7 +280,7 @@ pub fn duration(seconds: f64) -> String {
 /// Time left, from throughput over a sliding window rather than the instantaneous speed
 /// the readout shows. Connection ramp-up, a slow chunk or a stall move the instant speed by
 /// an order of magnitude, which would make the estimate swing the same way.
-struct Eta {
+pub(crate) struct Eta {
     samples: VecDeque<(Instant, u64)>,
     rate: f64,
     updated: Instant,
@@ -295,7 +295,7 @@ const ETA_WARMUP: Duration = Duration::from_secs(3);
 const ETA_STALL: Duration = Duration::from_secs(6);
 
 #[derive(Debug, PartialEq)]
-enum Remaining {
+pub(crate) enum Remaining {
     Estimating,
     Stalled,
     Seconds(f64),
@@ -347,7 +347,7 @@ impl Eta {
         self.updated = now;
     }
 
-    fn remaining(&self, now: Instant, left: u64) -> Remaining {
+    pub(crate) fn remaining(&self, now: Instant, left: u64) -> Remaining {
         if left == 0 {
             return Remaining::Seconds(0.0);
         }
@@ -366,7 +366,7 @@ impl Eta {
 }
 
 /// Coarser as the figure grows, so a long estimate does not flicker every second.
-fn eta_text(seconds: f64) -> String {
+pub(crate) fn eta_text(seconds: f64) -> String {
     let s = seconds.max(0.0).round();
     duration(match s as u64 {
         0..=119 => s,
@@ -375,18 +375,18 @@ fn eta_text(seconds: f64) -> String {
     })
 }
 
-struct State {
-    started: Instant,
+pub(crate) struct State {
+    pub(crate) started: Instant,
     sampled: Instant,
     sampled_bytes: u64,
-    speed: f64,
-    history: VecDeque<f64>,
+    pub(crate) speed: f64,
+    pub(crate) history: VecDeque<f64>,
     history_at: Instant,
-    eta: Eta,
+    pub(crate) eta: Eta,
 }
 
 impl State {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let now = Instant::now();
         Self {
             started: now,
@@ -398,7 +398,7 @@ impl State {
             eta: Eta::new(now),
         }
     }
-    fn observe(&mut self, received: u64) {
+    pub(crate) fn observe(&mut self, received: u64) {
         let now = Instant::now();
         self.eta.observe(now, received);
         let span = now.duration_since(self.sampled).as_secs_f64();
@@ -422,7 +422,7 @@ impl State {
     }
 }
 
-fn wave(line: &mut Line, p: &Palette, g: &Glyphs, frame: usize, cells: usize) {
+pub(crate) fn wave(line: &mut Line, p: &Palette, g: &Glyphs, frame: usize, cells: usize) {
     for i in 0..cells {
         let height = WAVE[(frame + i * 2) % WAVE.len()];
         let style = if height >= 6 {
@@ -438,7 +438,7 @@ fn wave(line: &mut Line, p: &Palette, g: &Glyphs, frame: usize, cells: usize) {
 
 /// A bar of `cells` cells. Known progress fills smoothly with a moving glint; unknown
 /// progress shows a comet bouncing along the track.
-fn bar(
+pub(crate) fn bar(
     line: &mut Line,
     p: &Palette,
     g: &Glyphs,
@@ -488,7 +488,7 @@ fn bar(
     }
 }
 
-fn sparkline(history: &VecDeque<f64>, g: &Glyphs) -> String {
+pub(crate) fn sparkline(history: &VecDeque<f64>, g: &Glyphs) -> String {
     let peak = history.iter().copied().fold(0.0, f64::max);
     if peak <= 0.0 {
         return String::new();
@@ -531,20 +531,18 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
     let lane_rows = slots.div_ceil(columns);
     // One tile per chunk where it fits: a tile and its gap are two columns wide, about as
     // wide as a terminal row is tall, so the map reads as a square grid that fills up.
-    let map_columns = (width - 4) / 2;
-    let per_cell = chunks.div_ceil(map_columns * MAP_ROWS).max(1);
-    let map_cells = chunks.div_ceil(per_cell);
-    let map_rows = if map_cells == 0 {
-        0
-    } else {
-        map_cells.div_ceil(map_columns)
-    };
+    let (_, map_rows) = map_shape(chunks, width);
     let budget = if rows == 0 { 24 } else { rows }.saturating_sub(2);
     let basic = 1 + 2 + 1 + 2;
-    let with_map = basic + if map_rows > 0 { 1 + 1 + map_rows } else { 0 };
+    let with_map = basic
+        + if map_rows > 0 {
+            1 + 1 + 1 + map_rows
+        } else {
+            0
+        };
     let with_lanes = with_map
         + if slots > 0 && chunks > 0 {
-            1 + 1 + lane_rows
+            1 + 1 + 1 + lane_rows
         } else {
             0
         };
@@ -619,38 +617,7 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
     if verifying {
         stats.put(p.bright, "Verifying SHA-256").put(p.dim, " ...");
     } else {
-        match t.total {
-            Some(total) => stats
-                .put(p.white, &bytes(done_bytes))
-                .put(p.dim, &format!(" of {}", bytes(total))),
-            None => stats.put(p.white, &bytes(done_bytes)),
-        };
-        stats.gap(5).put(
-            p.bright,
-            &format!("{} {}/s", g.down, bytes(st.speed as u64)),
-        );
-        let spark = sparkline(&st.history, &g);
-        if !spark.is_empty() && width >= 64 {
-            stats.gap(2).put(p.cyan, &spark);
-        }
-        if let Some(total) = t.total {
-            let left = total.saturating_sub(done_bytes);
-            stats.gap(5);
-            match st.eta.remaining(Instant::now(), left) {
-                Remaining::Seconds(s) => stats.put(p.white, &eta_text(s)).put(p.dim, " left"),
-                Remaining::Estimating => stats.put(p.dim, "estimating..."),
-                Remaining::Stalled => stats.put(p.dim, "stalled"),
-            };
-        }
-        stats.gap(5).put(
-            p.dim,
-            &format!("elapsed {}", duration(st.started.elapsed().as_secs_f64())),
-        );
-        if resumed > 0 && width >= 90 {
-            stats
-                .gap(5)
-                .put(p.dim, &format!("resumed {}", bytes(resumed)));
-        }
+        transfer_stats(&mut stats, &p, &g, width, st, done_bytes, t.total, resumed);
     }
     out.push(stats.text);
 
@@ -662,6 +629,7 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
             .put(p.dim, "CONNECTIONS")
             .put(p.dim, &format!("   {} active", lanes.len()));
         out.push(title.text);
+        out.push(blank());
         let column_width = (width - 2) / columns;
         for row in 0..lane_rows {
             let mut line = Line::new(width, &p);
@@ -690,53 +658,144 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
     }
 
     if level >= 2 && map_rows > 0 {
-        out.push(blank());
-        let mut title = Line::new(width, &p);
-        title.gap(2).put(p.dim, "CHUNK MAP");
-        title.put(
-            p.dim,
-            &format!(
-                "   each cell = {}   ",
-                bytes(per_cell as u64 * chunk_bytes(t))
-            ),
+        chunk_map(
+            &mut out,
+            &p,
+            &g,
+            width,
+            frame,
+            "CHUNK MAP",
+            chunks,
+            chunk_bytes(t),
+            |chunk| t.states[chunk].load(Relaxed),
         );
-        title
-            .put(p.cyan, &g.done.to_string())
-            .put(p.dim, " done   ");
-        title
-            .put(p.white, &g.flight[0].to_string())
-            .put(p.dim, " downloading   ");
-        title.put(p.dim, &format!("{} waiting", g.wait));
-        out.push(title.text);
-        for row in 0..map_rows {
-            let mut line = Line::new(width, &p);
-            line.gap(2);
-            for cell in (row * map_columns)..((row + 1) * map_columns).min(map_cells) {
-                let from = cell * per_cell;
-                let to = ((cell + 1) * per_cell).min(chunks);
-                let (mut done, mut flying) = (0, 0);
-                for state in &t.states[from..to] {
-                    match state.load(Relaxed) {
-                        DONE => done += 1,
-                        IN_FLIGHT => flying += 1,
-                        _ => {}
-                    }
-                }
-                if flying > 0 {
-                    line.put(p.white, &g.flight[(frame / 2 + cell) % 2].to_string());
-                } else if done == to - from {
-                    line.put(p.cyan, &g.done.to_string());
-                } else if done > 0 {
-                    line.put(p.cyan, &g.some.to_string());
-                } else {
-                    line.put(p.dim, &g.wait.to_string());
-                }
-                line.gap(1);
-            }
-            out.push(line.text);
-        }
     }
     out
+}
+
+/// The numbers under the bar: size so far, speed with its sparkline, time left, time spent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn transfer_stats(
+    stats: &mut Line,
+    p: &Palette,
+    g: &Glyphs,
+    width: usize,
+    st: &State,
+    done: u64,
+    total: Option<u64>,
+    resumed: u64,
+) {
+    match total {
+        Some(total) => stats
+            .put(p.white, &bytes(done))
+            .put(p.dim, &format!(" of {}", bytes(total))),
+        None => stats.put(p.white, &bytes(done)),
+    };
+    stats.gap(5).put(
+        p.bright,
+        &format!("{} {}/s", g.down, bytes(st.speed as u64)),
+    );
+    let spark = sparkline(&st.history, g);
+    if !spark.is_empty() && width >= 64 {
+        stats.gap(2).put(p.cyan, &spark);
+    }
+    if let Some(total) = total {
+        let left = total.saturating_sub(done);
+        stats.gap(5);
+        match st.eta.remaining(Instant::now(), left) {
+            Remaining::Seconds(s) => stats.put(p.white, &eta_text(s)).put(p.dim, " left"),
+            Remaining::Estimating => stats.put(p.dim, "estimating..."),
+            Remaining::Stalled => stats.put(p.dim, "stalled"),
+        };
+    }
+    stats.gap(5).put(
+        p.dim,
+        &format!("elapsed {}", duration(st.started.elapsed().as_secs_f64())),
+    );
+    if resumed > 0 && width >= 90 {
+        stats
+            .gap(5)
+            .put(p.dim, &format!("resumed {}", bytes(resumed)));
+    }
+}
+
+/// Rows the chunk map takes for `chunks` tiles at this width, as `(per_cell, rows)`; zero rows
+/// when there is nothing to draw.
+pub(crate) fn map_shape(chunks: usize, width: usize) -> (usize, usize) {
+    let columns = (width - 4) / 2;
+    let per_cell = chunks.div_ceil(columns * MAP_ROWS).max(1);
+    let cells = chunks.div_ceil(per_cell);
+    (per_cell, cells.div_ceil(columns))
+}
+
+/// The map of every chunk: a title with its legend, then one tile per chunk (or per group of
+/// chunks on large downloads) that fills up as they finish. `state` reports `PENDING`,
+/// `IN_FLIGHT` or `DONE` for one chunk.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chunk_map(
+    out: &mut Vec<String>,
+    p: &Palette,
+    g: &Glyphs,
+    width: usize,
+    frame: usize,
+    name: &str,
+    chunks: usize,
+    chunk_bytes: u64,
+    state: impl Fn(usize) -> u8,
+) {
+    let (per_cell, rows) = map_shape(chunks, width);
+    if rows == 0 {
+        return;
+    }
+    let columns = (width - 4) / 2;
+    let cells = chunks.div_ceil(per_cell);
+    out.push(String::new());
+    let mut title = Line::new(width, p);
+    title.gap(2).put(p.dim, name);
+    if chunk_bytes > 0 {
+        title.put(
+            p.dim,
+            &format!("   each cell = {}   ", bytes(per_cell as u64 * chunk_bytes)),
+        );
+    } else {
+        title.gap(3);
+    }
+    title
+        .put(p.cyan, &g.done.to_string())
+        .put(p.dim, " done   ");
+    title
+        .put(p.white, &g.flight[0].to_string())
+        .put(p.dim, " downloading   ");
+    title.put(p.dim, &format!("{} waiting", g.wait));
+    out.push(title.text);
+    out.push(String::new());
+    for row in 0..rows {
+        let mut line = Line::new(width, p);
+        line.gap(2);
+        for cell in (row * columns)..((row + 1) * columns).min(cells) {
+            let from = cell * per_cell;
+            let to = ((cell + 1) * per_cell).min(chunks);
+            let (mut done, mut flying) = (0, 0);
+            for chunk in from..to {
+                match state(chunk) {
+                    DONE => done += 1,
+                    IN_FLIGHT => flying += 1,
+                    _ => {}
+                }
+            }
+            if flying > 0 {
+                line.put(p.white, &g.flight[(frame / 2 + cell) % 2].to_string());
+            } else if done == to - from {
+                line.put(p.cyan, &g.done.to_string());
+            } else if done > 0 {
+                line.put(p.cyan, &g.some.to_string());
+            } else {
+                line.put(p.dim, &g.wait.to_string());
+            }
+            line.gap(1);
+        }
+        out.push(line.text);
+    }
 }
 
 /// Bytes covered by one chunk, from the connection data when the map is drawn.
@@ -808,6 +867,11 @@ fn write_err(text: &str) {
     let _ = err.flush();
 }
 
+/// Whether the live display can be drawn: stderr is a terminal that understands escapes.
+pub fn interactive() -> bool {
+    Term::stderr().is_term() && enable_ansi()
+}
+
 /// Owns the drawing task. Dropping it, even on an error path, removes the display and
 /// brings the cursor back, so messages printed afterwards start on a clean line.
 pub struct Display {
@@ -818,20 +882,24 @@ pub struct Display {
 impl Display {
     /// Starts drawing when stderr is an interactive terminal; otherwise does nothing.
     pub fn start(telemetry: Arc<Telemetry>) -> Self {
+        let mut state = State::new();
+        Self::spawn(move |rows, cols| render(&telemetry, &mut state, rows, cols))
+    }
+
+    /// Calls `draw(rows, cols)` for a new frame every 80 ms until dropped, if the terminal
+    /// can show it.
+    pub fn spawn(mut draw: impl FnMut(usize, usize) -> Vec<String> + Send + 'static) -> Self {
         let drawn = Arc::new(AtomicUsize::new(0));
-        let terminal = Term::stderr();
-        if !terminal.is_term() || !enable_ansi() {
+        if !interactive() {
             return Self { task: None, drawn };
         }
         let lines = drawn.clone();
         let task = tokio::spawn(async move {
-            let mut state = State::new();
             let mut tick = tokio::time::interval(Duration::from_millis(80));
             loop {
                 tick.tick().await;
                 let (rows, cols) = Term::stderr().size();
-                let frame = render(&telemetry, &mut state, rows as usize, cols as usize);
-                paint(&frame, &lines);
+                paint(&draw(rows as usize, cols as usize), &lines);
             }
         });
         Self {
