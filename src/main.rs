@@ -92,7 +92,7 @@ pub struct Network {
 
 #[derive(Args, Clone)]
 pub struct Tuning {
-    /// Maximum simultaneous range requests (auto starts at two)
+    /// Maximum simultaneous range requests (auto starts at four)
     #[arg(short = 'j', long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=32))]
     connections: u8,
     /// Fixed connection count; otherwise adapt based on measured throughput

@@ -1,7 +1,8 @@
 """Deterministic loopback HTTP origin shared by integration tests and benchmarks.
 
 No external Python packages. Each ranged connection can have its own bandwidth
-cap, deliberately modeling servers with per-connection limits, not the internet.
+cap (`cap`) and all connections can share one link limit (`agg`), deliberately
+modeling servers with per-connection limits and finite lines, not the internet.
 """
 import hashlib
 import http.server
@@ -21,6 +22,8 @@ class Origin(http.server.ThreadingHTTPServer):
         self.hits = {}
         self.guard = threading.Lock()
         self.version = 1
+        # Shared bandwidth reservation clock for the optional aggregate cap.
+        self.agg_clock = 0.0
 
     @property
     def url(self):
@@ -56,6 +59,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         size = int(query.get("size", [2 * 1024 * 1024])[0])
         cap = float(query.get("cap", [0])[0]) * 1024 * 1024
+        agg = float(query.get("agg", [0])[0]) * 1024 * 1024
         latency = float(query.get("latency", [0])[0])
         route = parsed.path
         version = self.server.version
@@ -168,6 +172,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sent += count
             if cap:
                 time.sleep(max(0, sent / cap - (time.perf_counter() - began)))
+            if agg:
+                # All connections draw from one link: reserve the next slot on a shared clock.
+                with self.server.guard:
+                    now = time.perf_counter()
+                    self.server.agg_clock = max(now, self.server.agg_clock) + count / agg
+                    wait = self.server.agg_clock - now
+                time.sleep(max(0, wait))
 
 
 def start():
