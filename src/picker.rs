@@ -1,9 +1,9 @@
 use crate::{
     resolver::{Candidate, Kind},
-    sites,
+    sites, ui,
 };
 use anyhow::{bail, ensure, Result};
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::Select;
 use std::io::{self, IsTerminal};
 
 /// Labels originate in untrusted HTML. Strip terminal controls before rendering.
@@ -158,10 +158,10 @@ pub fn choose(
         })
         .collect::<Vec<_>>();
     eprintln!(
-        "Found {} downloads. Use Up/Down, Enter to download, Esc to cancel.",
+        "\n  Found {} downloads   ·   ↑/↓ move   ·   Enter download   ·   Esc cancel\n",
         links.len()
     );
-    let theme = ColorfulTheme::default();
+    let theme = ui::theme();
     let choice = Select::with_theme(&theme)
         .with_prompt("Choose a download")
         .items(&items)
@@ -170,7 +170,7 @@ pub fn choose(
         .interact_opt()?;
     if let Some(index) = choice {
         eprintln!(
-            "Selected: {}\n{}",
+            "\n  Selected  {}\n            \x1b[90m{}\x1b[0m\n",
             plain(&links[index].label),
             sites::short(&links[index].url)
         );

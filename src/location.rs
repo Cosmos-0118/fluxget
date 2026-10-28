@@ -1,7 +1,8 @@
 //! Where a download is saved: the Downloads folder unless the person picks another.
 
+use crate::ui;
 use anyhow::{Context, Result};
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{Input, Select};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -53,7 +54,8 @@ pub fn ask() -> Result<Option<PathBuf>> {
         format!("{name}  ({})", default.display()),
         "Pick a folder...".to_string(),
     ];
-    let theme = ColorfulTheme::default();
+    let theme = ui::theme();
+    eprintln!();
     loop {
         let choice = Select::with_theme(&theme)
             .with_prompt("Save to")
@@ -80,7 +82,7 @@ enum Picked {
 }
 
 fn type_folder(default: &Path) -> Result<PathBuf> {
-    let typed: String = Input::with_theme(&ColorfulTheme::default())
+    let typed: String = Input::with_theme(&ui::theme())
         .with_prompt("Folder path")
         .default(default.display().to_string())
         .interact_text()?;

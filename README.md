@@ -108,6 +108,16 @@ always wins and also skips it. A name already taken becomes `name (1).ext`, like
 a browser (use `--force` to replace). Set `FLUXGET_DOWNLOAD_DIR` to change the
 default folder.
 
+**Live display.** In a terminal a download shows the file, an overall bar with
+speed, ETA and a throughput sparkline, one lane per connection (which chunk each
+is fetching and how far along), and a map of every chunk (done, downloading,
+waiting). It adapts to the window size and disappears when the download ends;
+`--quiet`, `--json` and piped output stay plain.
+
+**Resuming.** `fx resume` with no name lists every paused download (found in the
+Downloads folder, the current folder, and the ones fluxget remembers) so you can
+pick one with the arrow keys. `fx resume <output>` still resumes a specific file.
+
 `fluxget winget install <package>` runs the Windows Package Manager with the same
 arguments, so one tool covers both file downloads and app installs.
 

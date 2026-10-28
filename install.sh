@@ -57,10 +57,10 @@ if [[ -z "${NO_COLOR:-}" ]]; then
 else c_dim='' c_cy='' c_wh='' c_gr='' c_rd='' c_b='' c_off=''; fi
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
     *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
-        g_full='█' g_empty='░' g_ok='✔' g_fail='✘' g_skip='–' g_dot=' · '
+        g_full='█' g_empty='░' g_ok='✔' g_fail='✘' g_skip='–' g_dot='   ·   '
         g_wave=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █) ;;
     *)
-        g_full='#' g_empty='-' g_ok='+' g_fail='x' g_skip='-' g_dot=' - '
+        g_full='#' g_empty='-' g_ok='+' g_fail='x' g_skip='-' g_dot='   -   '
         g_wave=(_ . - '~' = + '*' '#') ;;
 esac
 # One period of a sine wave, scaled to the eight block heights.
@@ -122,7 +122,7 @@ ui_header() {
     ((!ui_child)) || return 0
     if ((!ui_live)); then printf 'fluxget installer (%s)\n' "$1"; return 0; fi
     ui_wave 0 7
-    printf '\n  %s  %sfluxget%s  %sinstaller%s\n  %s%s%s\n\n' "$REPLY" "$c_b$c_wh" "$c_off" "$c_dim" "$c_off" "$c_dim" "$1" "$c_off"
+    printf '\n   %s   %sfluxget%s   %sinstaller%s\n\n   %s%s%s\n\n\n' "$REPLY" "$c_b$c_wh" "$c_off" "$c_dim" "$c_off" "$c_dim" "$1" "$c_off"
 }
 
 # ui_line ok|skip|fail LABEL DETAIL
@@ -135,19 +135,19 @@ ui_line() {
         skip) mark=$g_skip col=$c_dim ;;
         *) mark=$g_fail col=$c_rd ;;
     esac
-    printf '\r\033[2K  %s%s/%s%s  %s%s%s %s%-12s%s %s%s%s\n' "$c_dim" "$ui_step" "$ui_total" "$c_off" "$col" "$mark" "$c_off" "$c_wh" "$2" "$c_off" "$c_dim" "$3" "$c_off"
+    printf '\r\033[2K  %s%-3s%s   %s%s%s      %s%-13s%s   %s%s%s\n' "$c_dim" "$ui_step/$ui_total" "$c_off" "$col" "$mark" "$c_off" "$c_wh" "$2" "$c_off" "$c_dim" "$3" "$c_off"
 }
 
 ui_finish() {
     if ((!ui_live)); then printf 'Installed %s to %s\n' "$1" "$2"; return 0; fi
-    printf '\n  %s%s%s %sInstalled %s%s\n    %s%s%s\n' "$c_gr" "$g_ok" "$c_off" "$c_b$c_wh" "$1" "$c_off" "$c_dim" "$2" "$c_off"
+    printf '\n  %s%s%s   %sInstalled %s%s\n      %s%s%s\n\n' "$c_gr" "$g_ok" "$c_off" "$c_b$c_wh" "$1" "$c_off" "$c_dim" "$2" "$c_off"
 }
 
 # ui_download URL DEST LABEL: curl with a live progress line. The size comes from the response
 # headers curl itself dumps, so no extra request is made.
 ui_download() {
     local url=$1 dest=$2 label=$3 name hdr err pid status=0 total='' size=0 pm cells cols tail
-    local t0 now frame=0 last_t last_size speed=0 inst wave_text shown
+    local t0 now frame=0 last_t last_size speed=0 inst wave_text shown percent detail left bar_text
     name=${dest##*/}
     if ((!ui_live)); then
         curl --fail --silent --show-error --location --retry 3 "$url" -o "$dest" || return 1
@@ -159,7 +159,8 @@ ui_download() {
     curl --fail --silent --show-error --location --retry 3 -D "$hdr" "$url" -o "$dest" 2>"$err" &
     pid=$!
     trap 'kill "$pid" 2>/dev/null; printf "\033[?25h\n"; exit 130' INT TERM
-    printf '\033[?25l'
+    # Two rows are reserved and redrawn in place: the bar, then the numbers under it.
+    printf '\033[?25l\n\n'
     t0=$(ui_now_ms) last_t=$t0 last_size=0
     while kill -0 "$pid" 2>/dev/null; do
         now=$(ui_now_ms)
@@ -173,26 +174,34 @@ ui_download() {
             last_t=$now last_size=$size
         fi
         cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
-        ui_size "$size"; tail=$REPLY
-        pm=-1
+        pm=-1 percent='' left=''
+        ui_size "$size"; detail=$REPLY
         if [[ -n "$total" ]]; then
             if ((size > total)); then size=$total; fi
             pm=$((size * 1000 / total))
+            percent=$(printf '%5s%%' "$((pm / 10)).$((pm % 10))")
             ui_size "$size"; shown=$REPLY; ui_size "$total"
-            tail="$(printf '%3d%%' $((pm / 10)))  $shown / $REPLY"
+            detail="$shown of $REPLY"
         fi
-        if ((speed > 0)); then ui_size "$speed"; tail+="  $REPLY/s"; fi
-        cells=$((cols - 1 - 7 - 6 - 2 - 12 - 2 - 2 - ${#tail}))
-        if ((cells > 24)); then cells=24; fi
+        if ((speed > 0)); then ui_size "$speed"; detail+="     $REPLY/s"; fi
+        if [[ -n "$total" ]] && ((speed > 1)); then
+            left=$(((total - size) / speed + 1))
+            if ((left >= 60)); then detail+="     ETA $((left / 60))m $(printf '%02d' $((left % 60)))s"; else detail+="     ETA ${left}s"; fi
+        fi
+        cells=$((cols - 1 - 31 - 3 - 6))
+        if ((cells > 30)); then cells=30; fi
         frame=$(((now - t0) / 70))
-        ui_wave "$frame" 6; wave_text=$REPLY
-        printf '\r\033[2K  %s%s/%s%s  %s  %s%-12s%s ' "$c_dim" "$((ui_step + 1))" "$ui_total" "$c_off" "$wave_text" "$c_wh" "$label" "$c_off"
-        if ((cells >= 8)); then ui_bar "$pm" "$cells" "$frame"; printf '%s  ' "$REPLY"; fi
-        printf '%s%s%s' "$c_dim" "$tail" "$c_off"
+        ui_wave "$frame" 4; wave_text=$REPLY
+        bar_text=''
+        if ((cells >= 8)); then ui_bar "$pm" "$cells" "$frame"; bar_text="$REPLY   "; fi
+        printf '\033[2A\r\033[2K  %s%-3s%s   %s   %s%-13s%s   %s%s%s%s\n\r\033[2K               %s%s%s\n' \
+            "$c_dim" "$((ui_step + 1))/$ui_total" "$c_off" "$wave_text" "$c_wh" "$label" "$c_off" \
+            "$bar_text" "$c_wh" "$percent" "$c_off" "$c_dim" "$detail" "$c_off"
         sleep 0.06
     done
     wait "$pid" || status=$?
-    printf '\033[?25h'
+    # Wipe the two rows and leave the cursor on the first, ready for the finished-step line.
+    printf '\033[2A\r\033[2K\n\033[2K\033[1A\r\033[?25h'
     trap - INT TERM
     if ((status != 0)); then
         ui_line fail 'Download failed' "$name"
@@ -336,5 +345,8 @@ else
     ui_line skip PATH 'left unchanged (--no-modify-path)'
 fi
 ui_finish "$version" "$bin_dir/fluxget"
-if ((modify_path)); then printf '%s\n' 'Open a new terminal and run: fx --help   (or fluxget --help)'
-else printf '%s\n' 'Shell profiles were left unchanged (--no-modify-path).'; fi
+ui_indent=''
+if ((ui_live)); then ui_indent='  '; fi
+if ((modify_path)); then printf '%s%s\n' "$ui_indent" 'Open a new terminal and run: fx --help   (or fluxget --help)'
+else printf '%s%s\n' "$ui_indent" 'Shell profiles were left unchanged (--no-modify-path).'; fi
+if ((ui_live)); then printf '\n'; fi

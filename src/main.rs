@@ -3,10 +3,12 @@ mod engine;
 mod forges;
 mod http;
 mod location;
+mod paused;
 mod picker;
 mod resolver;
 mod sites;
 mod state;
+mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -32,9 +34,10 @@ enum Action {
     /// Understands GitHub/GitLab/Codeberg releases, Hugging Face, archive.org,
     /// SourceForge, Drive/Dropbox/OneDrive links, torrents and media pages
     Get(Download),
-    /// Resume using the checkpoint beside an output file
+    /// Resume an interrupted download: name its output file, or leave it out to
+    /// choose from everything that is paused
     Resume {
-        output: PathBuf,
+        output: Option<PathBuf>,
         #[command(flatten)]
         network: Network,
         #[command(flatten)]
@@ -269,6 +272,35 @@ async fn run() -> Result<()> {
             network,
             tuning,
         } => {
+            let output = match output {
+                Some(output) => output,
+                None => {
+                    let found = paused::discover();
+                    if found.is_empty() {
+                        eprintln!(
+                            "
+  Nothing to resume: no paused downloads found.
+"
+                        );
+                        return Ok(());
+                    }
+                    if picker::headless(false) {
+                        anyhow::bail!(
+                            "{} paused download(s); name the one to resume: fluxget resume <output>
+{}",
+                            found.len(),
+                            paused::listing(&found)
+                        );
+                    }
+                    match paused::choose(&found)? {
+                        Some(index) => found[index].output.clone(),
+                        None => {
+                            eprintln!("Cancelled; nothing resumed.");
+                            return Ok(());
+                        }
+                    }
+                }
+            };
             let checkpoint = state::load(&state::sidecar(&output, ".fluxget.json"))?;
             let client = http::client(&network)?;
             let info =

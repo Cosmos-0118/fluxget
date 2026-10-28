@@ -1,10 +1,11 @@
 use crate::{
     http::{self, Info},
+    paused,
     state::{self, Checkpoint},
+    ui::{self, Telemetry},
     Tuning,
 };
 use anyhow::{bail, ensure, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use std::{
@@ -12,10 +13,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
@@ -121,14 +119,17 @@ async fn fetch_chunk(
     index: usize,
     chunk_size: u64,
     retries: u8,
-    received: Arc<AtomicU64>,
+    telemetry: Arc<Telemetry>,
 ) -> Result<(usize, Vec<u8>, bool)> {
     let size = info.size.context("Range download requires size")?;
     let start = index as u64 * chunk_size;
     let end = (size - start).min(chunk_size) + start - 1;
     let expected = (end - start + 1) as usize;
+    let received = telemetry.received.clone();
+    let lane = telemetry.begin_lane(index, expected as u64);
     let mut throttled = false;
     for attempt in 0..=retries {
+        lane.lane.done.store(0, Ordering::Relaxed);
         let builder = client
             .get(&info.url)
             .header("range", format!("bytes={start}-{end}"))
@@ -166,6 +167,9 @@ async fn fetch_chunk(
                     );
                     data.extend_from_slice(&bytes);
                     received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    lane.lane
+                        .done
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -211,12 +215,17 @@ async fn segmented(
     checkpoint_path: &Path,
     state: &mut Checkpoint,
     tuning: &Tuning,
-    progress: &ProgressBar,
+    telemetry: &Arc<Telemetry>,
 ) -> Result<(u64, Controller)> {
     let resumed = state::validate_parts(file, state)?;
     file.set_len(state.size)?;
     state::save(checkpoint_path, state)?;
-    progress.set_position(resumed);
+    telemetry.resumed.store(resumed, Ordering::Relaxed);
+    for (index, hash) in state.chunks.iter().enumerate() {
+        if hash.is_some() {
+            telemetry.mark(index, ui::DONE);
+        }
+    }
     let mut queue: VecDeque<usize> = state
         .chunks
         .iter()
@@ -225,7 +234,7 @@ async fn segmented(
         .collect();
     let mut tasks = JoinSet::new();
     let mut controller = Controller::new(tuning);
-    let received = Arc::new(AtomicU64::new(0));
+    let received = telemetry.received.clone();
     let mut sample_start = Instant::now();
     let mut sample_bytes = 0u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
@@ -244,7 +253,7 @@ async fn segmented(
             info,
             state,
             tuning,
-            &received,
+            telemetry,
         );
         tokio::select! {
             _ = &mut cancel => {
@@ -257,7 +266,7 @@ async fn segmented(
                 controller.sample(seen.saturating_sub(sample_bytes) as f64 / elapsed.max(0.001));
                 sample_bytes = seen;
                 sample_start = Instant::now();
-                progress.set_message(format!("{} workers", controller.target));
+                telemetry.workers.store(controller.target, Ordering::Relaxed);
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
                 let (index, bytes, throttled) = result.context("No worker result")?? ?;
@@ -265,11 +274,11 @@ async fn segmented(
                     controller.throttled();
                 }
                 // Start the replacement request before touching the disk.
-                refill(&mut tasks, &mut queue, &controller, client, info, state, tuning, &received);
+                refill(&mut tasks, &mut queue, &controller, client, info, state, tuning, telemetry);
                 file.seek(SeekFrom::Start(index as u64 * state.chunk_size))?;
                 file.write_all(&bytes)?;
                 unsynced.push((index, state::hash(&bytes)));
-                progress.inc(bytes.len() as u64);
+                telemetry.mark(index, ui::DONE);
                 if last_flush.elapsed() >= Duration::from_secs(1) {
                     flush(file, checkpoint_path, state, &mut unsynced)?;
                     last_flush = Instant::now();
@@ -307,7 +316,7 @@ fn refill(
     info: &Info,
     state: &Checkpoint,
     tuning: &Tuning,
-    received: &Arc<AtomicU64>,
+    telemetry: &Arc<Telemetry>,
 ) {
     while tasks.len() < controller.target {
         let Some(index) = queue.pop_front() else {
@@ -319,7 +328,7 @@ fn refill(
             index,
             state.chunk_size,
             tuning.retries,
-            received.clone(),
+            telemetry.clone(),
         ));
     }
 }
@@ -329,14 +338,14 @@ async fn single(
     info: &Info,
     file: &mut File,
     tuning: &Tuning,
-    progress: &ProgressBar,
+    telemetry: &Arc<Telemetry>,
 ) -> Result<u64> {
     let cancel = tokio::signal::ctrl_c();
     tokio::pin!(cancel);
     for attempt in 0..=tuning.retries {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        progress.set_position(0);
+        telemetry.received.store(0, Ordering::Relaxed);
         let builder = client.get(&info.url);
         let builder = if let Some(etag) = &info.etag {
             builder.header("if-match", etag)
@@ -374,7 +383,9 @@ async fn single(
                         "Response exceeds probed size"
                     );
                     file.write_all(&bytes)?;
-                    progress.inc(bytes.len() as u64);
+                    telemetry
+                        .received
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -465,13 +476,23 @@ pub async fn download(
         .read(true)
         .write(true)
         .open(&part)?;
-    let progress = if tuning.quiet || tuning.json {
-        ProgressBar::hidden()
-    } else {
-        ProgressBar::new(info.size.unwrap_or(0))
-    };
-    progress.set_style(ProgressStyle::with_template("{spinner:.cyan} {bytes}/{total_bytes} [{wide_bar:.cyan/blue}] {bytes_per_sec} ETA {eta} {msg}")?);
-    progress.enable_steady_tick(Duration::from_millis(200));
+    let telemetry = Telemetry::new(
+        output
+            .file_name()
+            .map_or_else(|| "download".into(), |n| n.to_string_lossy().into_owned()),
+        url::Url::parse(&info.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default(),
+        info.size,
+        journal.as_ref().map_or(0, |j| j.chunks.len()),
+        tuning.connections as usize,
+    );
+    // The display removes itself when dropped, including on every error path.
+    let display = (!tuning.quiet && !tuning.json).then(|| ui::Display::start(telemetry.clone()));
+    if journal.is_some() {
+        paused::remember(&output);
+    }
     let started = Instant::now();
     let (bytes, resumed, peak, changes, strategy) = if let Some(journal) = journal.as_mut() {
         let (resumed, controller) = segmented(
@@ -481,7 +502,7 @@ pub async fn download(
             &checkpoint_path,
             journal,
             tuning,
-            &progress,
+            &telemetry,
         )
         .await?;
         (
@@ -496,12 +517,12 @@ pub async fn download(
             },
         )
     } else {
-        let bytes = single(&client, &info, &mut file, tuning, &progress).await?;
+        let bytes = single(&client, &info, &mut file, tuning, &telemetry).await?;
         (bytes, 0, 1, 0, "single-stream")
     };
     file.sync_all()?;
     drop(file);
-    progress.set_message("verifying SHA-256");
+    telemetry.phase.store(ui::VERIFYING, Ordering::Relaxed);
     let hash = state::hash_file(&part)?;
     if let Some(expected) = expected {
         ensure!(
@@ -516,7 +537,10 @@ pub async fn download(
     // A finished download leaves nothing beside it, which matters in a shared Downloads folder.
     drop(lock);
     let _ = fs::remove_file(state::sidecar(&output, ".fluxget.lock"));
-    progress.finish_and_clear();
+    paused::forget(&output);
+    if let Some(display) = display {
+        display.finish();
+    }
     let elapsed = started.elapsed().as_secs_f64();
     let summary = Summary {
         output,
@@ -532,6 +556,25 @@ pub async fn download(
     };
     if tuning.json {
         println!("{}", serde_json::to_string(&summary)?);
+    } else if dialoguer::console::Term::stdout().is_term() {
+        let name = summary
+            .output
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let resumed_note = if resumed > 0 {
+            format!("   resumed {}", ui::bytes(resumed))
+        } else {
+            String::new()
+        };
+        println!(
+            "\n  \x1b[32m✔\x1b[0m  \x1b[1;97mDownloaded\x1b[0m  {name}\n     \x1b[90m{}\x1b[0m\n     {} in {}   {:.1} MiB/s   up to {} connections{resumed_note}\n     \x1b[90mSHA-256 {}\x1b[0m\n",
+            summary.output.display(),
+            ui::bytes(bytes),
+            ui::duration(elapsed),
+            summary.mib_per_second,
+            peak,
+            summary.sha256
+        );
     } else {
         println!(
             "{}: {} bytes in {:.2}s ({:.2} MiB/s), resumed {} bytes\nSHA-256 {}",

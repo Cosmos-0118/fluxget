@@ -14,7 +14,6 @@ dialoguer = { version = "0.12", default-features = false }
 dirs = "7.0.0"
 fs2 = "0.4"
 httpdate = "1"
-indicatif = "0.17"
 percent-encoding = "2"
 reqwest = { version = "=0.12.22", default-features = false, features = ["rustls-tls", "http2", "stream", "socks"] }
 scraper = "0.24"
@@ -24,6 +23,9 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [profile.release]
 lto = "thin"

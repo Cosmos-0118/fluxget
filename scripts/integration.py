@@ -61,6 +61,12 @@ class Downloads(unittest.TestCase):
         for name in ("file.bin", "file (1).bin"):
             self.assertEqual(hashlib.sha256((folder / name).read_bytes()).hexdigest(), hashlib.sha256(payload(2 * 1024 * 1024)).hexdigest())
 
+    def test_resume_without_a_name_reports_when_nothing_is_paused(self):
+        env = {**os.environ, "FLUXGET_DOWNLOAD_DIR": self.temp.name, "FLUXGET_STATE_DIR": self.temp.name}
+        result = subprocess.run([str(BINARY), "resume"], capture_output=True, text=True, env=env, cwd=self.temp.name, timeout=40)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Nothing to resume", result.stderr)
+
     def test_redirect(self):
         self.get("/redirect")
         self.verify()

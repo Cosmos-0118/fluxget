@@ -46,12 +46,12 @@ if ($script:UiUnicode) {
     $script:UiFull = [string][char]0x2588
     $script:UiEmpty = [string][char]0x2591
     $script:UiWave = @(0x2581..0x2588 | ForEach-Object { [string][char]$_ })
-    $script:UiDot = ' ' + [char]0xB7 + ' '
+    $script:UiDot = '   ' + [char]0xB7 + '   '
 } else {
     $script:UiFull = '#'
     $script:UiEmpty = '-'
     $script:UiWave = @('_', '.', '-', '~', '=', '+', '*', '#')
-    $script:UiDot = ' - '
+    $script:UiDot = '   -   '
 }
 $script:UiCheck = if ($script:UiFancyMarks) { [string][char]0x2714 } elseif ($script:UiUnicode) { [string][char]0x221A } else { '+' }
 $script:UiCross = if ($script:UiFancyMarks) { [string][char]0x2718 } elseif ($script:UiUnicode) { [string][char]0xD7 } else { 'x' }
@@ -86,6 +86,42 @@ function Write-LiveLine([object[]]$Parts) {
 
 # The Add-* helpers append (text, colour) parts to a list; returning arrays of arrays
 # from functions would be flattened by the pipeline.
+# The active download is a two-row block redrawn in place at a fixed screen position.
+$script:UiTop = -1
+$script:UiRowLens = @(0, 0)
+
+function Open-LiveBlock {
+    Write-Host ''
+    Write-Host ''
+    $script:UiTop = [Console]::CursorTop - 2
+    $script:UiRowLens = @(0, 0)
+}
+
+function Write-LiveRow([int]$Row, [object[]]$Parts) {
+    $width = [Console]::WindowWidth - 1
+    [Console]::SetCursorPosition(0, $script:UiTop + $Row)
+    $length = 0
+    foreach ($part in $Parts) {
+        $text = [string]$part[0]
+        if ($length + $text.Length -gt $width) { $text = $text.Substring(0, [Math]::Max(0, $width - $length)) }
+        if ($text.Length -gt 0) { Write-Host -NoNewline -ForegroundColor $part[1] $text }
+        $length += $text.Length
+    }
+    if ($length -lt $script:UiRowLens[$Row]) { Write-Host -NoNewline (' ' * ($script:UiRowLens[$Row] - $length)) }
+    $script:UiRowLens[$Row] = $length
+}
+
+# Wipes the block and leaves the cursor on its first row, ready for the finished-step line.
+function Close-LiveBlock {
+    if ($script:UiTop -lt 0) { return }
+    foreach ($row in 0, 1) {
+        [Console]::SetCursorPosition(0, $script:UiTop + $row)
+        if ($script:UiRowLens[$row] -gt 0) { Write-Host -NoNewline (' ' * $script:UiRowLens[$row]) }
+    }
+    [Console]::SetCursorPosition(0, $script:UiTop)
+    $script:UiTop = -1
+}
+
 function New-Parts { return , (New-Object 'System.Collections.Generic.List[object]') }
 
 function Add-WaveParts($Parts, [int]$Frame, [int]$Cells) {
@@ -136,13 +172,15 @@ function Write-UiHeader([string]$Detail) {
     if ($script:UiIsChild) { return }
     if (-not $script:UiLive) { Write-Host "fluxget installer ($Detail)"; return }
     Write-Host ''
-    Write-Host -NoNewline '  '
+    Write-Host -NoNewline '   '
     $wave = New-Parts
     Add-WaveParts $wave 0 7
     foreach ($part in $wave) { Write-Host -NoNewline -ForegroundColor $part[1] $part[0] }
-    Write-Host -NoNewline -ForegroundColor White '  fluxget'
-    Write-Host -ForegroundColor DarkGray '  installer'
-    Write-Host -ForegroundColor DarkGray "  $Detail"
+    Write-Host -NoNewline -ForegroundColor White '   fluxget'
+    Write-Host -ForegroundColor DarkGray '   installer'
+    Write-Host ''
+    Write-Host -ForegroundColor DarkGray "   $Detail"
+    Write-Host ''
     Write-Host ''
 }
 
@@ -157,7 +195,7 @@ function Write-UiStep([string]$State, [string]$Label, [string]$Detail) {
     if ($State -eq 'ok') { $mark = $script:UiCheck; $color = 'Green' }
     elseif ($State -eq 'skip') { $mark = $script:UiSkip; $color = 'DarkGray' }
     else { $mark = $script:UiCross; $color = 'Red' }
-    Write-LiveLine @(@("  $count ".PadRight(7), 'DarkGray'), @("$mark ", $color), @($Label.PadRight(12), 'White'), @($Detail, 'Gray'))
+    Write-LiveLine @(@(('  ' + $count.PadRight(3) + '   '), 'DarkGray'), @(($mark.PadRight(4) + '   '), $color), @(($Label.PadRight(13) + '   '), 'White'), @($Detail, 'Gray'))
     Write-Host ''
     $script:UiLastLen = 0
 }
@@ -165,9 +203,10 @@ function Write-UiStep([string]$State, [string]$Label, [string]$Detail) {
 function Write-UiDone([string]$Version, [string]$Path) {
     if (-not $script:UiLive) { Write-Host "Installed $Version to $Path"; return }
     Write-Host ''
-    Write-Host -NoNewline -ForegroundColor Green "  $($script:UiCheck) "
+    Write-Host -NoNewline -ForegroundColor Green "  $($script:UiCheck)   "
     Write-Host -ForegroundColor White "Installed $Version"
-    Write-Host -ForegroundColor DarkGray "    $Path"
+    Write-Host -ForegroundColor DarkGray "      $Path"
+    Write-Host ''
 }
 
 # Streams a file with a live progress line. Keeps animating even while the network stalls.
@@ -199,6 +238,7 @@ function Receive-UiFile([string]$Uri, [string]$OutFile, [string]$Label) {
             $width = 80
             if ($script:UiLive) {
                 try { [Console]::CursorVisible = $false; $cursorHidden = $true } catch { }
+                Open-LiveBlock
             }
             $pending = $stream.ReadAsync($buffer, 0, $buffer.Length)
             while ($true) {
@@ -224,35 +264,42 @@ function Receive-UiFile([string]$Uri, [string]$OutFile, [string]$Label) {
                     $width = [Console]::WindowWidth - 1
                     $known = $null -ne $total -and $total -gt 0
                     $fraction = if ($known) { [Math]::Min(1.0, $received / [double]$total) } else { 0.0 }
-                    $tail = if ($known) {
-                        '{0,3}%  {1} / {2}' -f [int][Math]::Floor($fraction * 100), (Format-Size $received), (Format-Size $total)
-                    } else { Format-Size $received }
-                    if ($speed -gt 0) { $tail += '  ' + (Format-Size $speed) + '/s' }
-                    $fixed = 7 + 7 + 2 + 12 + 2 + 2 + $tail.Length
-                    $cells = [Math]::Min(24, $width - $fixed)
-                    $parts = New-Parts
-                    $parts.Add(@(("  {0}/{1} " -f ($script:UiIndex + 1), $script:UiTotal).PadRight(7), 'DarkGray'))
-                    Add-WaveParts $parts $frame 6
-                    $parts.Add(@('  ', 'Gray'))
-                    $parts.Add(@($Label.PadRight(12), 'White'))
-                    $parts.Add(@('  ', 'Gray'))
+                    $percent = if ($known) { '{0,5:0.0}%' -f ($fraction * 100) } else { '' }
+                    $cells = [Math]::Min(30, $width - 31 - 3 - 6)
+                    $top = New-Parts
+                    $top.Add(@(('  ' + ('{0}/{1}' -f ($script:UiIndex + 1), $script:UiTotal).PadRight(3) + '   '), 'DarkGray'))
+                    Add-WaveParts $top $frame 4
+                    $top.Add(@('   ', 'Gray'))
+                    $top.Add(@(($Label.PadRight(13) + '   '), 'White'))
                     if ($cells -ge 8) {
-                        Add-BarParts $parts $fraction $cells $frame $known
-                        $parts.Add(@('  ', 'Gray'))
+                        Add-BarParts $top $fraction $cells $frame $known
+                        $top.Add(@('   ', 'Gray'))
                     }
-                    $parts.Add(@($tail, 'Gray'))
-                    Write-LiveLine $parts
+                    $top.Add(@($percent, 'White'))
+                    Write-LiveRow 0 $top
+                    $detail = if ($known) { (Format-Size $received) + ' of ' + (Format-Size $total) } else { Format-Size $received }
+                    if ($speed -gt 0) { $detail += '     ' + (Format-Size $speed) + '/s' }
+                    if ($known -and $speed -gt 1) {
+                        $left = ($total - $received) / $speed
+                        $detail += '     ETA ' + $(if ($left -ge 60) { '{0}m {1:00}s' -f [int][Math]::Floor($left / 60), [int]($left % 60) } else { ('{0}s' -f [int][Math]::Ceiling($left)) })
+                    }
+                    $bottom = New-Parts
+                    $bottom.Add(@((' ' * 15), 'Gray'))
+                    $bottom.Add(@($detail, 'DarkGray'))
+                    Write-LiveRow 1 $bottom
                 }
             }
             $file.Dispose(); $file = $null
         } catch {
             if ($file) { $file.Dispose(); $file = $null }
+            Close-LiveBlock
             if ($cursorHidden) { [Console]::CursorVisible = $true; $cursorHidden = $false }
             $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
             Write-UiStep 'fail' 'Download failed' $name
             throw "Could not download ${Uri}: $reason"
         }
     } finally {
+        Close-LiveBlock
         if ($cursorHidden) { try { [Console]::CursorVisible = $true } catch { } }
         if ($file) { $file.Dispose() }
         if ($stream) { $stream.Dispose() }
@@ -456,8 +503,10 @@ if (-not $NoModifyPath) {
 }
 
 Write-UiDone $version $targetBinary
+$indent = if ($script:UiLive) { '  ' } else { '' }
 if ($NoModifyPath) {
-    Write-Host 'PATH was left unchanged (-NoModifyPath).'
+    Write-Host "${indent}PATH was left unchanged (-NoModifyPath)."
 } else {
-    Write-Host 'Open a new terminal and run: fx --help   (or fluxget --help)'
+    Write-Host "${indent}Open a new terminal and run: fx --help   (or fluxget --help)"
 }
+if ($script:UiLive) { Write-Host '' }
