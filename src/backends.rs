@@ -146,15 +146,32 @@ fn has_program(name: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// One stream is often throttled per connection (YouTube, most CDNs). yt-dlp fetches
-/// fragmented HLS/DASH formats concurrently itself; plain files go through aria2 when
-/// it is installed, which splits them across connections.
-fn parallel_args(aria2: bool) -> Vec<OsString> {
+/// YouTube serves each stream in 10 MiB requests and throttles long ones, so splitting a
+/// stream across aria2 connections is slower there (measured: about half the speed of
+/// yt-dlp's own downloader). Its fragmented formats are still fetched concurrently.
+fn throttles_split_downloads(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            ["youtube.com", "youtu.be", "youtube-nocookie.com"]
+                .iter()
+                .any(|site| host == *site || host.ends_with(&format!(".{site}")))
+        })
+}
+
+/// One stream is often throttled per connection (most CDNs). yt-dlp fetches fragmented
+/// HLS/DASH formats concurrently itself; plain files go through aria2 when it is
+/// installed, which splits them across connections. The downloader is named without a
+/// protocol: yt-dlp matches 'https:aria2c' against the shortened name 'http' and silently
+/// keeps its own single-connection downloader. aria2 declines the protocols it cannot
+/// handle, so those still fall back to yt-dlp's.
+fn parallel_args(aria2: bool, url: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["--concurrent-fragments".into(), "16".into()];
-    if aria2 {
+    if aria2 && !throttles_split_downloads(url) {
         args.extend([
             "--downloader".into(),
-            "http,https:aria2c".into(),
+            "aria2c".into(),
             "--downloader-args".into(),
             "aria2c:-x16 -s16 -k1M".into(),
         ]);
@@ -181,7 +198,7 @@ pub fn media(
         args.push("--proxy".into());
         args.push(proxy.into());
     }
-    args.extend(parallel_args(has_program("aria2c")));
+    args.extend(parallel_args(has_program("aria2c"), url));
     if let Some(browser) = &network.cookies_from_browser {
         args.push("--cookies-from-browser".into());
         args.push(browser.into());
@@ -217,11 +234,29 @@ mod tests {
 
     #[test]
     fn media_downloads_in_parallel_with_or_without_aria2() {
-        let plain = parallel_args(false);
+        let site = "https://example.com/watch/1";
+        let plain = parallel_args(false, site);
         assert_eq!(plain, ["--concurrent-fragments", "16"]);
-        let fast = parallel_args(true);
-        assert!(fast.iter().any(|a| a == "http,https:aria2c"));
+        let fast = parallel_args(true, site);
+        let position = fast.iter().position(|a| a == "--downloader").unwrap();
+        assert_eq!(fast[position + 1], "aria2c");
         assert!(fast.iter().any(|a| a == "aria2c:-x16 -s16 -k1M"));
+    }
+
+    #[test]
+    fn youtube_keeps_its_own_downloader() {
+        for url in [
+            "https://youtu.be/LVNfb5DC-C4?si=x",
+            "https://www.youtube.com/watch?v=LVNfb5DC-C4",
+            "https://music.youtube.com/watch?v=a",
+        ] {
+            assert_eq!(
+                parallel_args(true, url),
+                ["--concurrent-fragments", "16"],
+                "{url}"
+            );
+        }
+        assert!(!throttles_split_downloads("https://notyoutube.com/x"));
     }
 
     #[test]

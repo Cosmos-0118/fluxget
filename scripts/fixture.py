@@ -21,6 +21,7 @@ class Origin(http.server.ThreadingHTTPServer):
         self.hits = {}
         self.guard = threading.Lock()
         self.version = 1
+        self.chunk_requests = 0
 
     @property
     def url(self):
@@ -60,6 +61,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         route = parsed.path
         version = self.server.version
         tag = f'"fixture-{version}-{size}"'
+        validatorless = ("/noetag", "/changing")
+        # Routes whose file is replaced after the first few chunk requests.
+        replaced = ("/changing", "/lastmod-changing")
+        stamp = f"Wed, 21 Oct 2026 07:28:0{version} GMT"
         if route == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/file.bin" + ("?" + parsed.query if parsed.query else ""))
@@ -97,7 +102,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self.headers.get("If-Match") not in (None, tag):
+        if self.headers.get("If-Match") not in (None, tag) or (
+            route.startswith("/lastmod") and self.headers.get("If-Unmodified-Since") not in (None, stamp)
+        ):
             self.send_response(412)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -131,10 +138,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if route in replaced and actual_chunk:
+            with self.server.guard:
+                self.server.chunk_requests += 1
+                if self.server.chunk_requests > 3:
+                    version = 2
+                    stamp = "Wed, 21 Oct 2026 07:28:02 GMT"
+            if route == "/lastmod-changing" and version == 2 and self.headers.get("If-Unmodified-Since") not in (None, stamp):
+                self.send_response(412)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
         if latency and actual_chunk:
             time.sleep(latency)
         self.send_response(206 if ranged else 200)
-        if route != "/noetag":
+        if route.startswith("/lastmod"):
+            self.send_header("Last-Modified", stamp)
+        elif route not in validatorless:
             self.send_header("ETag", 'W/' + tag if route == "/weak" else tag)
         self.send_header("Content-Type", "application/octet-stream")
         length = max(0, end - start + 1)

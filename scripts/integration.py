@@ -76,14 +76,35 @@ class Downloads(unittest.TestCase):
         self.assertEqual(result["strategy"], "single-stream")
         self.verify()
 
-    def test_missing_validator_fallback(self):
-        result = json.loads(self.get("/noetag").stdout)
-        self.assertEqual(result["strategy"], "single-stream")
+    def test_missing_validator_still_downloads_in_parallel(self):
+        result = json.loads(self.get("/noetag", "--chunk-kib", "64").stdout)
+        self.assertEqual(result["strategy"], "adaptive-ranges")
+        self.assertEqual(result["validator"], "none")
         self.verify()
 
-    def test_weak_validator_fallback(self):
-        self.assertEqual(json.loads(self.get("/weak").stdout)["strategy"], "single-stream")
+    def test_last_modified_guards_parallel_download(self):
+        result = json.loads(self.get("/lastmod", "--chunk-kib", "64").stdout)
+        self.assertEqual(result["strategy"], "adaptive-ranges")
+        self.assertEqual(result["validator"], "last-modified")
         self.verify()
+
+    def test_weak_etag_still_downloads_in_parallel(self):
+        result = json.loads(self.get("/weak", "--chunk-kib", "64").stdout)
+        self.assertEqual(result["strategy"], "adaptive-ranges")
+        self.assertEqual(result["validator"], "weak-etag")
+        self.verify()
+
+    def test_file_replaced_without_a_validator_is_caught(self):
+        self.server.chunk_requests = 0
+        result = self.get("/changing", "-j", "1", "--chunk-kib", "256", success=False)
+        self.assertIn("changed", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_file_replaced_behind_last_modified_is_caught(self):
+        self.server.chunk_requests = 0
+        result = self.get("/lastmod-changing", "-j", "1", "--chunk-kib", "256", success=False)
+        self.assertIn("changed", result.stderr)
+        self.assertFalse(self.output.exists())
 
     def test_unknown_size_stream(self):
         self.get("/unknown")

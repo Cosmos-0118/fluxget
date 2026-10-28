@@ -277,6 +277,104 @@ pub fn duration(seconds: f64) -> String {
     }
 }
 
+/// Time left, from throughput over a sliding window rather than the instantaneous speed
+/// the readout shows. Connection ramp-up, a slow chunk or a stall move the instant speed by
+/// an order of magnitude, which would make the estimate swing the same way.
+struct Eta {
+    samples: VecDeque<(Instant, u64)>,
+    rate: f64,
+    updated: Instant,
+    progressed: Instant,
+}
+
+/// Throughput is measured over this long, and the estimate settles over about as long.
+const ETA_WINDOW: Duration = Duration::from_secs(30);
+/// No estimate before this much history: the first seconds only measure ramp-up.
+const ETA_WARMUP: Duration = Duration::from_secs(3);
+/// No new bytes for this long counts as a stall, not a slow transfer.
+const ETA_STALL: Duration = Duration::from_secs(6);
+
+#[derive(Debug, PartialEq)]
+enum Remaining {
+    Estimating,
+    Stalled,
+    Seconds(f64),
+}
+
+impl Eta {
+    fn new(now: Instant) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            rate: 0.0,
+            updated: now,
+            progressed: now,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, received: u64) {
+        if let Some(&(at, bytes)) = self.samples.back() {
+            if now.duration_since(at) < Duration::from_millis(250) {
+                return;
+            }
+            if received > bytes {
+                self.progressed = now;
+            }
+        } else {
+            self.progressed = now;
+        }
+        self.samples.push_back((now, received));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > ETA_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let (first_at, first_bytes) = self.samples[0];
+        let span = now.duration_since(first_at);
+        if span < ETA_WARMUP {
+            return;
+        }
+        let window = received.saturating_sub(first_bytes) as f64 / span.as_secs_f64();
+        let dt = now.duration_since(self.updated).as_secs_f64();
+        self.rate = if self.rate == 0.0 {
+            window
+        } else {
+            // Time-based weight, so the result does not depend on how often this runs.
+            let keep = (-dt / (ETA_WINDOW.as_secs_f64() / 3.0)).exp();
+            keep * self.rate + (1.0 - keep) * window
+        };
+        self.updated = now;
+    }
+
+    fn remaining(&self, now: Instant, left: u64) -> Remaining {
+        if left == 0 {
+            return Remaining::Seconds(0.0);
+        }
+        if self.rate == 0.0 {
+            return if now.duration_since(self.progressed) > ETA_STALL && self.samples.len() > 1 {
+                Remaining::Stalled
+            } else {
+                Remaining::Estimating
+            };
+        }
+        if now.duration_since(self.progressed) > ETA_STALL {
+            return Remaining::Stalled;
+        }
+        Remaining::Seconds(left as f64 / self.rate)
+    }
+}
+
+/// Coarser as the figure grows, so a long estimate does not flicker every second.
+fn eta_text(seconds: f64) -> String {
+    let s = seconds.max(0.0).round();
+    duration(match s as u64 {
+        0..=119 => s,
+        120..=3599 => (s / 5.0).round() * 5.0,
+        _ => (s / 60.0).round() * 60.0,
+    })
+}
+
 struct State {
     started: Instant,
     sampled: Instant,
@@ -284,6 +382,7 @@ struct State {
     speed: f64,
     history: VecDeque<f64>,
     history_at: Instant,
+    eta: Eta,
 }
 
 impl State {
@@ -296,10 +395,12 @@ impl State {
             speed: 0.0,
             history: VecDeque::new(),
             history_at: now,
+            eta: Eta::new(now),
         }
     }
     fn observe(&mut self, received: u64) {
         let now = Instant::now();
+        self.eta.observe(now, received);
         let span = now.duration_since(self.sampled).as_secs_f64();
         if span >= 0.25 {
             let instant = received.saturating_sub(self.sampled_bytes) as f64 / span;
@@ -532,12 +633,14 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
         if !spark.is_empty() && width >= 64 {
             stats.gap(2).put(p.cyan, &spark);
         }
-        if let (Some(total), true) = (t.total, st.speed > 1.0) {
-            let left = total.saturating_sub(done_bytes) as f64 / st.speed;
-            stats
-                .gap(5)
-                .put(p.white, &duration(left))
-                .put(p.dim, " left");
+        if let Some(total) = t.total {
+            let left = total.saturating_sub(done_bytes);
+            stats.gap(5);
+            match st.eta.remaining(Instant::now(), left) {
+                Remaining::Seconds(s) => stats.put(p.white, &eta_text(s)).put(p.dim, " left"),
+                Remaining::Estimating => stats.put(p.dim, "estimating..."),
+                Remaining::Stalled => stats.put(p.dim, "stalled"),
+            };
         }
         stats.gap(5).put(
             p.dim,
@@ -852,6 +955,81 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("9 of 16 connections"), "{text}");
+    }
+
+    fn feed(eta: &mut Eta, start: Instant, from: u64, to: u64, rate: u64) -> u64 {
+        let mut bytes = 0;
+        for tenth in from * 10..=to * 10 {
+            bytes = tenth * rate / 10;
+            eta.observe(start + Duration::from_millis(tenth * 100), bytes);
+        }
+        bytes
+    }
+
+    #[test]
+    fn eta_waits_for_history_then_follows_steady_throughput() {
+        let start = Instant::now();
+        let mut eta = Eta::new(start);
+        let mib = 1 << 20;
+        let total = 3000 * mib;
+        feed(&mut eta, start, 0, 2, 10 * mib);
+        assert_eq!(
+            eta.remaining(start + Duration::from_secs(2), total),
+            Remaining::Estimating
+        );
+        let done = feed(&mut eta, start, 3, 20, 10 * mib);
+        let now = start + Duration::from_secs(20);
+        let Remaining::Seconds(s) = eta.remaining(now, total - done) else {
+            panic!("expected an estimate");
+        };
+        assert!((s - 280.0).abs() < 3.0, "{s}");
+    }
+
+    #[test]
+    fn eta_ignores_a_brief_burst_or_dip() {
+        let start = Instant::now();
+        let mut eta = Eta::new(start);
+        let mib = 1 << 20;
+        let mut bytes = feed(&mut eta, start, 0, 30, 10 * mib);
+        let before = eta.rate;
+        // Two seconds at ten times the speed, then two seconds of nothing.
+        for tenth in 301..=320 {
+            bytes += 10 * mib;
+            eta.observe(start + Duration::from_millis(tenth * 100), bytes);
+        }
+        let after_burst = eta.rate;
+        assert!(after_burst < before * 1.4, "{before} -> {after_burst}");
+        for tenth in 321..=340 {
+            eta.observe(start + Duration::from_millis(tenth * 100), bytes);
+        }
+        assert!(eta.rate > before * 0.7, "{before} -> {}", eta.rate);
+    }
+
+    #[test]
+    fn eta_reports_a_stall_instead_of_a_huge_number() {
+        let start = Instant::now();
+        let mut eta = Eta::new(start);
+        let mib = 1 << 20;
+        let bytes = feed(&mut eta, start, 0, 10, 5 * mib);
+        for tenth in 101..=200 {
+            eta.observe(start + Duration::from_millis(tenth * 100), bytes);
+        }
+        assert_eq!(
+            eta.remaining(start + Duration::from_secs(20), 100 * mib),
+            Remaining::Stalled
+        );
+        assert_eq!(
+            eta.remaining(start + Duration::from_secs(20), 0),
+            Remaining::Seconds(0.0)
+        );
+    }
+
+    #[test]
+    fn long_estimates_are_rounded_so_they_do_not_flicker() {
+        assert_eq!(eta_text(59.6), "1m 00s");
+        assert_eq!(eta_text(301.0), "5m 00s");
+        assert_eq!(eta_text(304.0), "5m 05s");
+        assert_eq!(eta_text(3850.0), "1h 04m");
     }
 
     #[test]

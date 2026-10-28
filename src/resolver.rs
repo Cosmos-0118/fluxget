@@ -744,6 +744,8 @@ mod tests {
             size: None,
             ranges: false,
             etag: None,
+            weak_etag: None,
+            last_modified: None,
             filename: name.into(),
             content_type: ct.into(),
             protocol: "HTTP/1.1".into(),

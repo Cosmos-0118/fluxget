@@ -14,6 +14,10 @@ pub struct Checkpoint {
     pub url: String,
     pub size: u64,
     pub etag: Option<String>,
+    #[serde(default)]
+    pub weak_etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
     pub expected_sha256: Option<String>,
     pub chunk_size: u64,
     pub chunks: Vec<Option<String>>,
@@ -142,6 +146,8 @@ mod tests {
             url: "https://example.com/file".into(),
             size: 0,
             etag: None,
+            weak_etag: None,
+            last_modified: None,
             expected_sha256: None,
             chunk_size: 65536,
             chunks: vec![],
