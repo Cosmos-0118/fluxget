@@ -139,6 +139,29 @@ pub async fn torrent(
     report("aria2", "torrent", source, &dir, json)
 }
 
+fn has_program(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// One stream is often throttled per connection (YouTube, most CDNs). yt-dlp fetches
+/// fragmented HLS/DASH formats concurrently itself; plain files go through aria2 when
+/// it is installed, which splits them across connections.
+fn parallel_args(aria2: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--concurrent-fragments".into(), "16".into()];
+    if aria2 {
+        args.extend([
+            "--downloader".into(),
+            "http,https:aria2c".into(),
+            "--downloader-args".into(),
+            "aria2c:-x16 -s16 -k1M".into(),
+        ]);
+    }
+    args
+}
+
 /// Download a video or audio page with yt-dlp (a single item, not a playlist).
 pub fn media(
     url: &str,
@@ -158,13 +181,27 @@ pub fn media(
         args.push("--proxy".into());
         args.push(proxy.into());
     }
+    args.extend(parallel_args(has_program("aria2c")));
+    if let Some(browser) = &network.cookies_from_browser {
+        args.push("--cookies-from-browser".into());
+        args.push(browser.into());
+    }
     if quiet || json {
         args.push("--quiet".into());
         args.push("--no-warnings".into());
     }
     args.push("--".into());
     args.push(url.into());
-    run("yt-dlp", &args, json)?;
+    run("yt-dlp", &args, json).map_err(|error| {
+        if network.cookies_from_browser.is_some() {
+            return error;
+        }
+        error.context(
+            "If the site asked you to sign in or confirm you are not a bot, retry with \
+             'fluxget get --cookies-from-browser <chrome|firefox|safari|edge> <url>'; \
+             'yt-dlp -U' or 'brew upgrade yt-dlp' also fixes many extraction errors",
+        )
+    })?;
     report("yt-dlp", "media", url, &dir, json)
 }
 
@@ -176,6 +213,15 @@ mod tests {
     fn missing_program_gives_actionable_error() {
         let error = run("fluxget-definitely-not-installed", &[], false).unwrap_err();
         assert!(format!("{error:#}").contains("fluxget doctor"));
+    }
+
+    #[test]
+    fn media_downloads_in_parallel_with_or_without_aria2() {
+        let plain = parallel_args(false);
+        assert_eq!(plain, ["--concurrent-fragments", "16"]);
+        let fast = parallel_args(true);
+        assert!(fast.iter().any(|a| a == "http,https:aria2c"));
+        assert!(fast.iter().any(|a| a == "aria2c:-x16 -s16 -k1M"));
     }
 
     #[test]
