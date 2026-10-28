@@ -22,6 +22,8 @@ pub const VERIFYING: u8 = 1;
 
 /// Most connection lanes drawn; more connections still download, they just share a footer.
 const MAX_LANES: usize = 16;
+/// Most rows the chunk map may take; larger downloads share a tile between chunks.
+const MAP_ROWS: usize = 8;
 
 /// One connection working on one chunk.
 pub struct Lane {
@@ -426,12 +428,15 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
         .min(MAX_LANES);
     let columns = if slots > 6 && width >= 70 { 2 } else { 1 };
     let lane_rows = slots.div_ceil(columns);
-    let per_cell = chunks.div_ceil((width - 4) * 3).max(1);
+    // One tile per chunk where it fits: a tile and its gap are two columns wide, about as
+    // wide as a terminal row is tall, so the map reads as a square grid that fills up.
+    let map_columns = (width - 4) / 2;
+    let per_cell = chunks.div_ceil(map_columns * MAP_ROWS).max(1);
     let map_cells = chunks.div_ceil(per_cell);
     let map_rows = if map_cells == 0 {
         0
     } else {
-        map_cells.div_ceil(width - 4)
+        map_cells.div_ceil(map_columns)
     };
     let budget = if rows == 0 { 24 } else { rows }.saturating_sub(2);
     let basic = 1 + 2 + 1 + 2;
@@ -603,7 +608,7 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
         for row in 0..map_rows {
             let mut line = Line::new(width, &p);
             line.gap(2);
-            for cell in (row * (width - 4))..((row + 1) * (width - 4)).min(map_cells) {
+            for cell in (row * map_columns)..((row + 1) * map_columns).min(map_cells) {
                 let from = cell * per_cell;
                 let to = ((cell + 1) * per_cell).min(chunks);
                 let (mut done, mut flying) = (0, 0);
@@ -623,6 +628,7 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
                 } else {
                     line.put(p.dim, &g.wait.to_string());
                 }
+                line.gap(1);
             }
             out.push(line.text);
         }
