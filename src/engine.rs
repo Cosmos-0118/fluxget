@@ -429,7 +429,7 @@ pub async fn download(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let _lock = state::lock(&output)?;
+    let lock = state::lock(&output)?;
     let part = state::sidecar(&output, ".fluxget.part");
     let checkpoint_path = state::sidecar(&output, ".fluxget.json");
     // A missing strong validator makes safe range composition impossible.
@@ -513,6 +513,9 @@ pub async fn download(
     if checkpoint_path.exists() {
         fs::remove_file(checkpoint_path)?;
     }
+    // A finished download leaves nothing beside it, which matters in a shared Downloads folder.
+    drop(lock);
+    let _ = fs::remove_file(state::sidecar(&output, ".fluxget.lock"));
     progress.finish_and_clear();
     let elapsed = started.elapsed().as_secs_f64();
     let summary = Summary {

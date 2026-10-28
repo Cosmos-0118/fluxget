@@ -2,12 +2,13 @@ mod backends;
 mod engine;
 mod forges;
 mod http;
+mod location;
 mod picker;
 mod resolver;
 mod sites;
 mod state;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
     ffi::OsString,
@@ -65,6 +66,12 @@ enum Action {
         #[arg(allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Run the Windows Package Manager, e.g. 'fluxget winget install BurntSushi.ripgrep.MSVC'
+    #[command(trailing_var_arg = true)]
+    Winget {
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 #[derive(Args, Clone)]
@@ -109,7 +116,8 @@ pub struct Tuning {
 struct Download {
     /// Page, file or release URL; a magnet link; or a local .torrent file
     url: String,
-    /// Output file. For torrents and media pages: the output directory
+    /// Output file. For torrents and media pages: the output directory.
+    /// Without it, files go to your Downloads folder (a terminal asks first)
     #[arg(short, long)]
     output: Option<PathBuf>,
     /// Minutes to keep seeding after a torrent completes (0 stops immediately)
@@ -195,12 +203,37 @@ async fn run() -> Result<()> {
                 };
                 target
             };
+            // Probe the chosen file while the person answers the destination question.
+            let pending =
+                (target.kind == resolver::Kind::Http && target.info.is_none()).then(|| {
+                    let (client, url, retries) =
+                        (client.clone(), target.url.clone(), d.tuning.retries);
+                    tokio::spawn(async move {
+                        http::probe(&client, http::valid_url(&url)?, retries).await
+                    })
+                });
+            let folder = if d.output.is_some() {
+                None
+            } else if !picker::headless(d.tuning.json) && !d.tuning.quiet {
+                match location::ask()? {
+                    Some(folder) => Some(folder),
+                    None => {
+                        if let Some(task) = pending {
+                            task.abort();
+                        }
+                        eprintln!("Cancelled; no download started.");
+                        return Ok(());
+                    }
+                }
+            } else {
+                Some(location::downloads_dir())
+            };
             match target.kind {
                 resolver::Kind::Torrent => {
                     backends::torrent(
                         &client,
                         &target.url,
-                        d.output.as_deref(),
+                        d.output.as_deref().or(folder.as_deref()),
                         d.seed_minutes,
                         d.tuning.quiet,
                         d.tuning.json,
@@ -209,20 +242,23 @@ async fn run() -> Result<()> {
                 }
                 resolver::Kind::Media => backends::media(
                     &target.url,
-                    d.output.as_deref(),
+                    d.output.as_deref().or(folder.as_deref()),
                     &d.network,
                     d.tuning.quiet,
                     d.tuning.json,
                 )?,
                 resolver::Kind::Http => {
-                    let info = match target.info {
-                        Some(info) => info,
-                        None => {
-                            let url = http::valid_url(&target.url)?;
-                            http::probe(&client, url, d.tuning.retries).await?
-                        }
+                    let info = match (target.info, pending) {
+                        (Some(info), _) => info,
+                        (None, Some(task)) => task.await.context("File probe stopped")??,
+                        (None, None) => unreachable!("an unprobed HTTP target is always probed"),
                     };
-                    let output = d.output.unwrap_or_else(|| PathBuf::from(&info.filename));
+                    let output = match (d.output, folder) {
+                        (Some(output), _) => output,
+                        (None, Some(folder)) if d.force => folder.join(&info.filename),
+                        (None, Some(folder)) => location::free_name(&folder, &info.filename),
+                        (None, None) => PathBuf::from(&info.filename),
+                    };
                     let expected = d.sha256.or(target.sha256);
                     engine::download(client, info, output, expected, d.force, &d.tuning).await?;
                 }
@@ -266,7 +302,12 @@ async fn run() -> Result<()> {
                 std::env::consts::OS,
                 std::env::consts::ARCH
             );
-            for program in ["aria2c", "yt-dlp", "curl"] {
+            let tools: &[&str] = if cfg!(windows) {
+                &["aria2c", "yt-dlp", "curl", "winget"]
+            } else {
+                &["aria2c", "yt-dlp", "curl"]
+            };
+            for &program in tools {
                 match Command::new(program).arg("--version").output() {
                     Ok(o) if o.status.success() => println!(
                         "{program}: {}",
@@ -281,6 +322,7 @@ async fn run() -> Result<()> {
         }
         Action::Aria2 { args } => backends::run("aria2c", &args, false)?,
         Action::Media { args } => backends::run("yt-dlp", &args, false)?,
+        Action::Winget { args } => backends::run("winget", &args, false)?,
     }
     Ok(())
 }

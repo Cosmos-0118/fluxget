@@ -69,6 +69,17 @@ class Installers(unittest.TestCase):
         result = subprocess.run([str(self.target), "--version"], capture_output=True, text=True, check=True)
         self.assertTrue(result.stdout.startswith("fluxget "))
         self.assertTrue((self.install_root / "LICENSE").is_file())
+        short = self.install_root / "bin" / ("fx.exe" if WINDOWS else "fx")
+        result = subprocess.run([str(short), "--version"], capture_output=True, text=True, check=True)
+        self.assertTrue(result.stdout.startswith("fluxget "))
+
+    def test_short_name_never_replaces_an_unrelated_program(self):
+        short = self.install_root / "bin" / ("fx.exe" if WINDOWS else "fx")
+        short.parent.mkdir(parents=True)
+        short.write_bytes(b"someone else's fx")
+        self.install()
+        self.assertEqual(short.read_bytes(), b"someone else's fx")
+        self.assertTrue(self.target.is_file())
 
     def test_reinstall_identical_binary_is_noop(self):
         self.install()

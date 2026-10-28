@@ -95,6 +95,22 @@ fluxget resolve https://example.org/downloads
 fluxget resume downloads/archive.zip
 ```
 
+The installer also adds **`fx`**, a two-letter copy of the command, so
+`fx https://example.org/archive.zip` works the same. An unrelated program already
+named `fx` in the install folder is never replaced.
+
+**Where files go.** Without `-o`, downloads are saved in your **Downloads
+folder**. In a terminal, fluxget asks first: *Downloads* is preselected, or choose
+*Pick a folder...* to open the system folder picker (Windows file dialog, macOS
+Finder, zenity/kdialog on Linux, or a typed path when no dialog is available).
+Piped, `--json` and `--quiet` runs skip the question and use Downloads; `-o`
+always wins and also skips it. A name already taken becomes `name (1).ext`, like
+a browser (use `--force` to replace). Set `FLUXGET_DOWNLOAD_DIR` to change the
+default folder.
+
+`fluxget winget install <package>` runs the Windows Package Manager with the same
+arguments, so one tool covers both file downloads and app installs.
+
 Quote URLs containing `&` or shell special characters. `get URL` and bare `URL`
 are equivalent. A page with multiple downloads opens an **arrow-key picker**:
 use **Up/Down**, **Enter** to download, or **Esc** to cancel. A likely OS/CPU match

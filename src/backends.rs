@@ -32,6 +32,7 @@ pub fn run(program: &str, args: &[OsString], json: bool) -> Result<()> {
     let name = match program {
         "aria2c" => "aria2 (https://aria2.github.io/)",
         "yt-dlp" => "yt-dlp (https://github.com/yt-dlp/yt-dlp)",
+        "winget" => "winget (the Windows Package Manager, included with Windows 10 and 11)",
         other => other,
     };
     let status = command

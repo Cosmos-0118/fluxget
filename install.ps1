@@ -413,10 +413,27 @@ foreach ($name in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt')) {
         Copy-Item -LiteralPath $source -Destination $target -Force
     }
 }
+# fx is a short copy of fluxget. Leave an unrelated fx.exe alone.
+$shortName = 'fx'
+$shortBinary = Join-Path $binDir 'fx.exe'
+$shortOurs = $true
+if (Test-Path -LiteralPath $shortBinary) {
+    $shortVersion = try { & $shortBinary --version 2>$null } catch { '' }
+    $shortOurs = "$shortVersion" -match '^fluxget [0-9]'
+}
+if ($shortOurs) {
+    try {
+        if (-not (Test-Path -LiteralPath $shortBinary) -or (Get-Sha256 $shortBinary) -ne (Get-Sha256 $targetBinary)) {
+            Copy-Item -LiteralPath $targetBinary -Destination $shortBinary -Force
+        }
+    } catch { $shortOurs = $false }
+}
+if (-not $shortOurs) { $shortName = $null }
+$installedDetail = if ($shortName) { 'fluxget and fx in place, with documentation' } else { 'executable and documentation in place' }
 if ($alreadyInstalled) {
     Write-UiStep 'skip' 'Installed' "$version is already installed; refreshing PATH and documentation."
 } else {
-    Write-UiStep 'ok' 'Installed' 'executable and documentation in place'
+    Write-UiStep 'ok' 'Installed' $installedDetail
 }
 
 if (-not $NoModifyPath) {
@@ -442,5 +459,5 @@ Write-UiDone $version $targetBinary
 if ($NoModifyPath) {
     Write-Host 'PATH was left unchanged (-NoModifyPath).'
 } else {
-    Write-Host 'Open a new terminal and run: fluxget --help'
+    Write-Host 'Open a new terminal and run: fx --help   (or fluxget --help)'
 }

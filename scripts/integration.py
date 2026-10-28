@@ -51,6 +51,16 @@ class Downloads(unittest.TestCase):
         self.verify()
         self.assertFalse(Path(str(self.output) + ".fluxget.json").exists())
 
+    def test_default_folder_and_taken_names(self):
+        folder = Path(self.temp.name) / "Downloads"
+        env = {**os.environ, "FLUXGET_DOWNLOAD_DIR": str(folder)}
+        for _ in range(2):
+            result = subprocess.run([str(BINARY), self.server.url + "/file.bin", "--direct", "--json"], capture_output=True, text=True, env=env, timeout=40)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["file (1).bin", "file.bin"])
+        for name in ("file.bin", "file (1).bin"):
+            self.assertEqual(hashlib.sha256((folder / name).read_bytes()).hexdigest(), hashlib.sha256(payload(2 * 1024 * 1024)).hexdigest())
+
     def test_redirect(self):
         self.get("/redirect")
         self.verify()

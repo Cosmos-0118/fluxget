@@ -302,8 +302,15 @@ for name in README.md LICENSE THIRD_PARTY_NOTICES.txt; do
         cp -- "$package_dir/$name" "$install_root/$name"
     fi
 done
+# fx is a short link to fluxget. Leave an unrelated fx alone.
+short_ok=0
+if [[ -L "$bin_dir/fx" && "$(readlink "$bin_dir/fx")" == fluxget ]] || [[ ! -e "$bin_dir/fx" && ! -L "$bin_dir/fx" ]]; then
+    ln -sfn fluxget "$bin_dir/fx" && short_ok=1
+fi
+if ((short_ok)); then installed_detail='fluxget and fx in place, with documentation'
+else installed_detail='executable and documentation in place'; fi
 if ((already_installed)); then ui_line skip Installed "$version is already installed; refreshing PATH and documentation."
-else ui_line ok Installed 'executable and documentation in place'; fi
+else ui_line ok Installed "$installed_detail"; fi
 
 path_changed=0
 if ((modify_path)); then
@@ -329,5 +336,5 @@ else
     ui_line skip PATH 'left unchanged (--no-modify-path)'
 fi
 ui_finish "$version" "$bin_dir/fluxget"
-if ((modify_path)); then printf '%s\n' 'Open a new terminal and run: fluxget --help'
+if ((modify_path)); then printf '%s\n' 'Open a new terminal and run: fx --help   (or fluxget --help)'
 else printf '%s\n' 'Shell profiles were left unchanged (--no-modify-path).'; fi

@@ -94,7 +94,8 @@ pub fn default_index(links: &[Candidate]) -> usize {
         .unwrap_or(0)
 }
 
-fn headless(json: bool) -> bool {
+/// No person to ask: JSON output, or input or output is not a terminal.
+pub fn headless(json: bool) -> bool {
     json || !io::stdin().is_terminal() || !io::stderr().is_terminal()
 }
 
