@@ -108,7 +108,12 @@ enum Step {
 }
 
 /// One resolution step: a file was reached, or there are choices to make.
-async fn step(client: &Client, url: &Url, retries: u8) -> Result<Step> {
+async fn step(
+    client: &Client,
+    url: &Url,
+    retries: u8,
+    prefetched: Option<Fetched>,
+) -> Result<Step> {
     match sites::route(url) {
         Route::Rewrite(candidate) => return Ok(Step::Choose(vec![candidate])),
         Route::Choices(candidates) => return Ok(Step::Choose(candidates)),
@@ -126,7 +131,11 @@ async fn step(client: &Client, url: &Url, retries: u8) -> Result<Step> {
         }
         Route::Generic => {}
     }
-    match http::fetch(client, url.clone(), retries).await? {
+    let fetched = match prefetched {
+        Some(fetched) => fetched,
+        None => http::fetch(client, url.clone(), retries).await?,
+    };
+    match fetched {
         Fetched::File(info) => Ok(Step::File(info)),
         Fetched::Page { url, body } => Ok(Step::Choose(
             page_candidates(client, &url, &body, retries).await,
@@ -179,7 +188,7 @@ async fn page_candidates(client: &Client, url: &Url, body: &str, retries: u8) ->
 /// Every download the page at `raw` offers, without choosing one.
 pub async fn discover(client: &Client, raw: &str) -> Result<Vec<Candidate>> {
     let url = http::valid_url(raw)?;
-    Ok(match step(client, &url, 2).await? {
+    Ok(match step(client, &url, 2, None).await? {
         Step::File(info) => {
             let kind = kind_of_file(&info);
             vec![Candidate::new(info.url, "Direct download").kind(kind)]
@@ -507,12 +516,13 @@ pub async fn select(
     let mut url = http::valid_url(raw)?;
     let mut visited = BTreeSet::new();
     let mut digest = None;
+    let mut prefetched = None;
     for _ in 0..4 {
         ensure!(
             visited.insert(url.to_string()),
             "Download landing-page loop detected"
         );
-        let links = match step(client, &url, 2).await? {
+        let links = match step(client, &url, 2, prefetched.take()).await? {
             Step::File(info) => {
                 let kind = kind_of_file(&info);
                 return Ok(Some(Target {
@@ -524,10 +534,24 @@ pub async fn select(
             }
             Step::Choose(links) => links,
         };
-        let Some(index) = picker::choose(&links, selection.take(), force_picker, json)? else {
+        // While the person decides, fetch the highlighted download: its DNS,
+        // TLS and redirects are done, or its answer is already here, on Enter.
+        let guess = picker::will_prompt(&links, selection, force_picker, json)
+            .then(|| picker::default_index(&links))
+            .and_then(|i| speculate(client, &links[i]).map(|task| (i, task)));
+        let choice = picker::choose(&links, selection.take(), force_picker, json);
+        force_picker = false;
+        if let Some((guessed, task)) = guess {
+            match choice {
+                Ok(Some(index)) if index == guessed => {
+                    prefetched = task.await.ok().and_then(Result::ok);
+                }
+                _ => task.abort(),
+            }
+        }
+        let Some(index) = choice? else {
             return Ok(None);
         };
-        force_picker = false;
         let chosen = &links[index];
         if chosen.kind != Kind::Http {
             return Ok(Some(Target {
@@ -541,6 +565,21 @@ pub async fn select(
         url = http::valid_url(&chosen.url)?;
     }
     bail!("Too many download landing pages. Run 'fluxget resolve URL' and choose a direct file URL")
+}
+
+/// Start the request `step` would make for a plain web candidate.
+fn speculate(
+    client: &Client,
+    candidate: &Candidate,
+) -> Option<tokio::task::JoinHandle<Result<Fetched>>> {
+    let url = http::valid_url(&candidate.url).ok()?;
+    if candidate.kind != Kind::Http || !matches!(sites::route(&url), Route::Generic) {
+        return None;
+    }
+    let client = client.clone();
+    Some(tokio::spawn(
+        async move { http::fetch(&client, url, 0).await },
+    ))
 }
 
 /// Inputs that are not web pages: a magnet link or a `.torrent` file on disk.
@@ -707,6 +746,52 @@ mod tests {
             Kind::Media
         );
         assert_eq!(kind_of_file(&info("application/zip", "f.zip")), Kind::Http);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn speculative_fetch_is_reused_without_another_request() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 2048];
+                    while stream.read(&mut buf).is_ok_and(|n| n > 0) {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let reply = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/5\r\nContent-Length: 1\r\nContent-Type: application/zip\r\nETag: \"abc\"\r\n\r\nx";
+                        if stream.write_all(reply.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let client = reqwest::Client::new();
+        let candidate = Candidate::new(format!("http://127.0.0.1:{port}/a.zip"), "a");
+        let fetched = speculate(&client, &candidate)
+            .expect("plain web candidates are fetched ahead")
+            .await
+            .unwrap()
+            .unwrap();
+        let url = Url::parse(&candidate.url).unwrap();
+        let outcome = step(&client, &url, 0, Some(fetched)).await.unwrap();
+        assert!(matches!(outcome, Step::File(info) if info.size == Some(5)));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(speculate(
+            &client,
+            &Candidate::new(
+                "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a",
+                "m"
+            )
+        )
+        .is_none());
+        assert!(speculate(&client, &Candidate::new("https://github.com/o/r", "repo")).is_none());
     }
     #[test]
     fn magnets_and_local_torrents_skip_the_web() {

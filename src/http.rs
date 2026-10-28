@@ -1,12 +1,96 @@
 use crate::Network;
 use anyhow::{bail, ensure, Context, Result};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Client, Response, StatusCode,
 };
 use serde::Serialize;
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
 use url::Url;
+
+/// Hyper divides the connect timeout between a host's addresses and tries them
+/// in resolver order, so one unreachable CDN node listed first costs seconds
+/// on every new connection. Race the addresses once per host and hand back the
+/// ones that answered first.
+#[derive(Default)]
+struct Resolver {
+    known: Arc<Mutex<HashMap<String, Vec<SocketAddr>>>>,
+}
+
+impl Resolve for Resolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let known = self.known.clone();
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let cached = known.lock().ok().and_then(|k| k.get(&host).cloned());
+            let addrs = match cached {
+                Some(addrs) => addrs,
+                None => {
+                    let found: Vec<SocketAddr> =
+                        tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+                    let ordered = live_first(found, &[443, 80]).await;
+                    if let Ok(mut k) = known.lock() {
+                        k.insert(host, ordered.clone());
+                    }
+                    ordered
+                }
+            };
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// `addrs` with those that accepted (or actively refused) a TCP connection
+/// first, in the order they answered. Silent ones keep their place at the end.
+async fn live_first(addrs: Vec<SocketAddr>, ports: &[u16]) -> Vec<SocketAddr> {
+    if addrs.len() < 2 {
+        return addrs;
+    }
+    let mut probes = tokio::task::JoinSet::new();
+    for (index, addr) in addrs.iter().enumerate().take(8) {
+        for &port in ports {
+            let target = SocketAddr::new(addr.ip(), port);
+            probes.spawn(async move {
+                let answered = match tokio::net::TcpStream::connect(target).await {
+                    Ok(_) => true,
+                    Err(e) => matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                    ),
+                };
+                (index, answered)
+            });
+        }
+    }
+    let mut live: Vec<usize> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    let mut until = deadline;
+    while let Ok(Some(done)) = tokio::time::timeout_at(until, probes.join_next()).await {
+        if let Ok((index, true)) = done {
+            if live.is_empty() {
+                until = until.min(tokio::time::Instant::now() + Duration::from_millis(2));
+            }
+            if !live.contains(&index) {
+                live.push(index);
+            }
+        }
+    }
+    if live.is_empty() {
+        return addrs;
+    }
+    let rest = (0..addrs.len()).filter(|i| !live.contains(i));
+    live.iter()
+        .copied()
+        .chain(rest.collect::<Vec<_>>())
+        .map(|i| addrs[i])
+        .collect()
+}
 
 /// Accept pasted `example.com/path` by assuming HTTPS; everything else is left alone.
 pub fn normalize(raw: &str) -> String {
@@ -87,6 +171,7 @@ pub fn client(options: &Network) -> Result<Client> {
         .user_agent(concat!("fluxget/", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
         .redirect(redirect)
+        .dns_resolver(Arc::new(Resolver::default()))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(options.timeout))
         .pool_max_idle_per_host(32);
@@ -333,6 +418,18 @@ mod tests {
         ] {
             assert!(range(bad).is_err());
         }
+    }
+    #[tokio::test]
+    async fn answering_addresses_are_tried_before_silent_ones() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent: SocketAddr = "192.0.2.1:0".parse().unwrap();
+        let live: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let started = std::time::Instant::now();
+        let order = live_first(vec![silent, live], &[port]).await;
+        assert_eq!(order, vec![live, silent]);
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert_eq!(live_first(vec![silent], &[port]).await, vec![silent]);
     }
     #[test]
     fn pasted_hosts_get_a_scheme() {

@@ -97,3 +97,19 @@ completes an unthrottled 256 MiB transfer in 0.44 s versus 0.90 s. Landing-page
 resolution for code.visualstudio.com fell from 0.6-5.9 s to 8 ms, because the
 adapter now knows all 25 builds and needs no page fetch. Resolution latency, not
 transfer speed, is what the old binary spent extra seconds on.
+
+## Connection latency (2026-10-28)
+
+Two latency costs were removed from the resolve step. While the arrow-key picker
+waits for a person, the highlighted download is requested in the background
+(one `Range: bytes=0-0` GET, redirects included), so Enter on that entry starts
+with DNS, TLS and the redirect chain done and the file's size, validator and
+range support already known; choosing another entry cancels it. Separately,
+hyper splits the connect timeout between a host's addresses and tries them in
+resolver order, so one unreachable CDN node listed first stalled every new
+connection to `release-assets.githubusercontent.com` by about 3.8 s on the test
+machine (curl happened to pick a live node). A custom resolver now probes a
+multi-address host's addresses concurrently once per process and returns the
+ones that answered first. Resolving a GitHub release asset URL fell from about
+3.9 s to about 0.15 s; hosts whose addresses all answer pay one extra handshake
+round trip (about 10 ms measured on code.visualstudio.com).

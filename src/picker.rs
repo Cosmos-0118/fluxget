@@ -84,6 +84,30 @@ fn origin_tag(candidate: &Candidate) -> String {
     }
 }
 
+/// The entry the interactive picker highlights first.
+pub fn default_index(links: &[Candidate]) -> usize {
+    links
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, c)| (score(c), std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn headless(json: bool) -> bool {
+    json || !io::stdin().is_terminal() || !io::stderr().is_terminal()
+}
+
+/// Whether `choose` will block on a person, which is the time to get ahead.
+pub fn will_prompt(
+    links: &[Candidate],
+    selection: Option<usize>,
+    force_picker: bool,
+    json: bool,
+) -> bool {
+    selection.is_none() && (links.len() > 1 || force_picker) && !headless(json)
+}
+
 pub fn choose(
     links: &[Candidate],
     selection: Option<usize>,
@@ -105,7 +129,7 @@ pub fn choose(
     if links.len() == 1 && !force_picker {
         return Ok(Some(0));
     }
-    if json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+    if headless(json) {
         let choices = links
             .iter()
             .enumerate()
@@ -122,12 +146,7 @@ pub fn choose(
             .join("\n");
         bail!("Found {} downloads. Use --select N to choose one without a terminal, or 'fluxget resolve URL' for JSON.\n{choices}", links.len());
     }
-    let default = links
-        .iter()
-        .enumerate()
-        .max_by_key(|(i, c)| (score(c), std::cmp::Reverse(*i)))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let default = default_index(links);
     let width = dialoguer::console::Term::stderr().size().1.max(40) as usize;
     let items = links
         .iter()
