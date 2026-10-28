@@ -316,29 +316,89 @@ async fn github_page_fallback(
                 _ => return Ok(None),
             }
         }
-        Scope::List => anyhow::bail!(blocked),
+        Scope::List => {
+            let tags = page_tags(client, web, owner, repo).await?;
+            if tags.is_empty() {
+                anyhow::bail!(blocked)
+            }
+            eprintln!("{blocked}; using the release page instead (no checksum verification).");
+            let mut out = Vec::new();
+            for tag in &tags {
+                let prefix = format!("[{tag}] ");
+                out.extend(page_assets(client, web, owner, repo, tag, &prefix).await?);
+                out.extend(source_archives(web, owner, repo, tag, &prefix));
+            }
+            return Ok(Some(out));
+        }
     };
     eprintln!("{blocked}; using the release page instead (no checksum verification).");
+    let mut out = page_assets(client, web, owner, repo, &tag, "").await?;
+    if out.is_empty() {
+        return Ok(None);
+    }
+    out.extend(source_archives(web, owner, repo, &tag, ""));
+    Ok(Some(out))
+}
+
+fn source_archives(web: &str, owner: &str, repo: &str, tag: &str, prefix: &str) -> Vec<Candidate> {
+    [(".zip", "zip"), (".tar.gz", "tar.gz")]
+        .iter()
+        .map(|(ext, name)| {
+            Candidate::new(
+                join(web, &[owner, repo, "archive", "refs", "tags", tag]) + ext,
+                prefixed(prefix, format!("Source code ({name})")),
+            )
+        })
+        .collect()
+}
+
+async fn page_assets(
+    client: &Client,
+    web: &str,
+    owner: &str,
+    repo: &str,
+    tag: &str,
+    prefix: &str,
+) -> Result<Vec<Candidate>> {
     let fragment = Url::parse(&join(
         web,
-        &[owner, repo, "releases", "expanded_assets", &tag],
+        &[owner, repo, "releases", "expanded_assets", tag],
     ))?;
     let Fetched::Page { url, body } = http::fetch(client, fragment, 1).await? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let page = resolver::extract(&body, &url);
-    let mut out: Vec<Candidate> = page
+    Ok(resolver::extract(&body, &url)
         .links
         .into_iter()
         .filter(|c| c.url.contains("/releases/download/"))
-        .collect();
-    for (ext, name) in [(".zip", "zip"), (".tar.gz", "tar.gz")] {
-        out.push(Candidate::new(
-            join(web, &[owner, repo, "archive", "refs", "tags", &tag]) + ext,
-            format!("Source code ({name})"),
-        ));
+        .map(|mut c| {
+            c.label = prefixed(prefix, c.label);
+            c
+        })
+        .collect())
+}
+
+/// Newest release tags scraped from the releases page, which is not rate limited.
+async fn page_tags(client: &Client, web: &str, owner: &str, repo: &str) -> Result<Vec<String>> {
+    let list = Url::parse(&join(web, &[owner, repo, "releases"]))?;
+    let Fetched::Page { body, .. } = http::fetch(client, list, 1).await? else {
+        return Ok(Vec::new());
+    };
+    let marker = format!("/{owner}/{repo}/releases/tag/");
+    let mut tags: Vec<String> = Vec::new();
+    for part in body.split(&marker).skip(1) {
+        let raw = part.split(['"', '\'', '?', '#', '<']).next().unwrap_or("");
+        let tag = percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned();
+        if !tag.is_empty() && !tags.contains(&tag) {
+            tags.push(tag);
+        }
+        if tags.len() == 3 {
+            break;
+        }
     }
-    Ok(Some(out))
+    Ok(tags)
 }
 
 // ---- GitLab -------------------------------------------------------------

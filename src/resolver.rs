@@ -137,10 +137,25 @@ async fn step(
     };
     match fetched {
         Fetched::File(info) => Ok(Step::File(info)),
-        Fetched::Page { url, body } => Ok(Step::Choose(
-            page_candidates(client, &url, &body, retries).await,
-        )),
+        Fetched::Page { url, body } => {
+            let links = page_candidates(client, &url, &body, retries).await;
+            if links.is_empty() && builds_link_with_script(&body) {
+                bail!(
+                    "{} builds its download link with JavaScript (an edition or language form), so there is no link in the page to find. \
+                     Choose the download in a browser, copy the link it gives you, and run 'fluxget <that link>'",
+                    url.host_str().unwrap_or("This page")
+                );
+            }
+            Ok(Step::Choose(links))
+        }
     }
+}
+
+/// A download form (a dropdown plus a script) that produces its link on the
+/// client, as Microsoft's software-download pages do.
+fn builds_link_with_script(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("<select") && body.contains("<script") && body.contains("download")
 }
 
 /// Links on a page, plus those on up to three same-origin download indexes,
