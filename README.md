@@ -26,6 +26,11 @@ irm https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.sh | bash
 ```
 
+In a terminal the installer shows a live step list with a flowing wave and a
+progress bar (size, speed). Piped or CI output gets plain `[n/total]` lines; set
+`FLUXGET_PLAIN=1` to force that, `FLUXGET_ASCII=1` for ASCII-only glyphs, or
+`NO_COLOR=1` to drop colour.
+
 Prefer clicking? Download the matching ZIP from
 [Releases](https://github.com/Cosmos-0118/fluxget/releases/latest), extract it,
 then double-click **Install.cmd** on Windows or **Install.command** on macOS.
