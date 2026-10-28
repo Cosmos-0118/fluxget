@@ -139,6 +139,46 @@ pub async fn torrent(
     report("aria2", "torrent", source, &dir, json)
 }
 
+fn has_program(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// YouTube serves each stream in 10 MiB requests and throttles long ones, so splitting a
+/// stream across aria2 connections is slower there (measured: about half the speed of
+/// yt-dlp's own downloader). Its fragmented formats are still fetched concurrently.
+fn throttles_split_downloads(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            ["youtube.com", "youtu.be", "youtube-nocookie.com"]
+                .iter()
+                .any(|site| host == *site || host.ends_with(&format!(".{site}")))
+        })
+}
+
+/// One stream is often throttled per connection (most CDNs). yt-dlp fetches fragmented
+/// HLS/DASH formats concurrently itself; plain files go through aria2 when it is
+/// installed, which splits them across connections. The downloader is named without a
+/// protocol: yt-dlp matches 'https:aria2c' against the shortened name 'http' and silently
+/// keeps its own single-connection downloader. aria2 declines the protocols it cannot
+/// handle, so those still fall back to yt-dlp's.
+fn parallel_args(aria2: bool, url: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--concurrent-fragments".into(), "16".into()];
+    if aria2 && !throttles_split_downloads(url) {
+        args.extend([
+            "--downloader".into(),
+            "aria2c".into(),
+            "--downloader-args".into(),
+            "aria2c:-x16 -s16 -k1M".into(),
+        ]);
+    }
+    args
+}
+
 /// Download a video or audio page with yt-dlp (a single item, not a playlist).
 pub fn media(
     url: &str,
@@ -158,13 +198,27 @@ pub fn media(
         args.push("--proxy".into());
         args.push(proxy.into());
     }
+    args.extend(parallel_args(has_program("aria2c"), url));
+    if let Some(browser) = &network.cookies_from_browser {
+        args.push("--cookies-from-browser".into());
+        args.push(browser.into());
+    }
     if quiet || json {
         args.push("--quiet".into());
         args.push("--no-warnings".into());
     }
     args.push("--".into());
     args.push(url.into());
-    run("yt-dlp", &args, json)?;
+    run("yt-dlp", &args, json).map_err(|error| {
+        if network.cookies_from_browser.is_some() {
+            return error;
+        }
+        error.context(
+            "If the site asked you to sign in or confirm you are not a bot, retry with \
+             'fluxget get --cookies-from-browser <chrome|firefox|safari|edge> <url>'; \
+             'yt-dlp -U' or 'brew upgrade yt-dlp' also fixes many extraction errors",
+        )
+    })?;
     report("yt-dlp", "media", url, &dir, json)
 }
 
@@ -176,6 +230,33 @@ mod tests {
     fn missing_program_gives_actionable_error() {
         let error = run("fluxget-definitely-not-installed", &[], false).unwrap_err();
         assert!(format!("{error:#}").contains("fluxget doctor"));
+    }
+
+    #[test]
+    fn media_downloads_in_parallel_with_or_without_aria2() {
+        let site = "https://example.com/watch/1";
+        let plain = parallel_args(false, site);
+        assert_eq!(plain, ["--concurrent-fragments", "16"]);
+        let fast = parallel_args(true, site);
+        let position = fast.iter().position(|a| a == "--downloader").unwrap();
+        assert_eq!(fast[position + 1], "aria2c");
+        assert!(fast.iter().any(|a| a == "aria2c:-x16 -s16 -k1M"));
+    }
+
+    #[test]
+    fn youtube_keeps_its_own_downloader() {
+        for url in [
+            "https://youtu.be/LVNfb5DC-C4?si=x",
+            "https://www.youtube.com/watch?v=LVNfb5DC-C4",
+            "https://music.youtube.com/watch?v=a",
+        ] {
+            assert_eq!(
+                parallel_args(true, url),
+                ["--concurrent-fragments", "16"],
+                "{url}"
+            );
+        }
+        assert!(!throttles_split_downloads("https://notyoutube.com/x"));
     }
 
     #[test]

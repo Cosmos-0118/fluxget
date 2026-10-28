@@ -88,6 +88,10 @@ pub struct Network {
     /// Per-request timeout, including body transfer
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
     timeout: u64,
+    /// Let yt-dlp use the sign-in cookies of a browser (chrome, firefox, safari, edge, ...) for
+    /// media pages that ask you to confirm you are not a bot
+    #[arg(long, value_name = "BROWSER")]
+    cookies_from_browser: Option<String>,
 }
 
 #[derive(Args, Clone)]

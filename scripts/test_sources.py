@@ -290,14 +290,26 @@ class Sources(unittest.TestCase):
         self.assertIn("exited with", result.stderr)
 
     # ---- media pages ------------------------------------------------------------------
-    def test_media_page_goes_to_ytdlp_for_one_item(self):
-        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLsomething"
+    def media_call(self, url):
         done = json.loads(self.run_cli(url, "-o", self.folder / "videos", "--json").stdout)
         self.assertEqual((done["backend"], done["kind"]), ("yt-dlp", "media"))
-        [call] = self.calls()
+        # fluxget also probes aria2c with --version to decide whether to hand plain files to it
+        [call] = [c for c in self.calls() if c["args"] != ["--version"]]
         self.assertIn("--no-playlist", call["args"])
+        self.assertEqual(call["args"][call["args"].index("--concurrent-fragments") + 1], "16")
         self.assertEqual(call["args"][call["args"].index("--paths") + 1], str(self.folder / "videos"))
         self.assertEqual(call["args"][-2:], ["--", url])
+        return call["args"]
+
+    def test_media_page_goes_to_ytdlp_for_one_item(self):
+        args = self.media_call("https://vimeo.com/76979871")
+        # Named without a protocol: yt-dlp ignores 'https:aria2c' and keeps its own downloader.
+        self.assertEqual(args[args.index("--downloader") + 1], "aria2c")
+
+    def test_youtube_keeps_ytdlp_downloader(self):
+        # Splitting a YouTube stream across aria2 connections measured about half as fast.
+        args = self.media_call("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLsomething")
+        self.assertNotIn("--downloader", args)
 
     def test_page_with_video_and_stream_playlist(self):
         found = self.resolve(f"{self.server.url}/video")

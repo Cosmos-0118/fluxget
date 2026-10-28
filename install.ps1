@@ -323,8 +323,19 @@ if ($localRoot) {
     }
 }
 if (-not $hasLocalPayload) {
-    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-    $architecture = switch ($architecture) { 'x64' { 'x86_64' } 'arm64' { 'aarch64' } default { throw "Unsupported Windows CPU: $architecture" } }
+    # RuntimeInformation is missing on older .NET Framework (Windows PowerShell 5.1 before 4.7.1)
+    # and reports the process, not the OS, in some hosts; the environment variables always work.
+    $architecture = $null
+    try { $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch {}
+    if (-not $architecture) {
+        # A 32-bit PowerShell on 64-bit Windows hides the real CPU in PROCESSOR_ARCHITEW6432.
+        $architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    }
+    $architecture = switch -Regex (("$architecture").ToLowerInvariant()) {
+        '^(x64|amd64)$' { 'x86_64' }
+        '^arm64$' { 'aarch64' }
+        default { throw "Unsupported Windows CPU: $architecture (fluxget supports x64 and ARM64)" }
+    }
     if ($Version -ne 'latest' -and $Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][a-zA-Z0-9.]+)?$') {
         throw 'Version must be latest or a release tag such as v0.1.0.'
     }

@@ -186,7 +186,12 @@ pub struct Info {
     pub url: String,
     pub size: Option<u64>,
     pub ranges: bool,
+    /// Strong ETag: sent as `If-Match`.
     pub etag: Option<String>,
+    /// Weak ETag: only compared between responses, never sent (`If-Match` needs a strong one).
+    pub weak_etag: Option<String>,
+    /// Sent verbatim as `If-Unmodified-Since` when there is no strong ETag.
+    pub last_modified: Option<String>,
     pub filename: String,
     pub content_type: String,
     pub protocol: String,
@@ -260,6 +265,10 @@ pub async fn request(builder: reqwest::RequestBuilder, retries: u8) -> Result<(R
                 if status == StatusCode::RANGE_NOT_SATISFIABLE {
                     return Ok((response, throttled));
                 }
+                ensure!(
+                    status != StatusCode::PRECONDITION_FAILED,
+                    "Remote file changed during the download (precondition failed)"
+                );
                 return Ok((response.error_for_status()?, throttled));
             }
             Err(e) if attempt == retries => return Err(e.into()),
@@ -349,9 +358,63 @@ async fn probe_response(mut response: Response) -> Result<Info> {
     info(&response, response.content_length(), false)
 }
 
+impl Info {
+    /// What guards the file against changing between requests, strongest first.
+    pub fn validator(&self) -> &'static str {
+        if self.etag.is_some() {
+            "etag"
+        } else if self.last_modified.is_some() {
+            "last-modified"
+        } else if self.weak_etag.is_some() {
+            "weak-etag"
+        } else {
+            "none"
+        }
+    }
+
+    /// Adds the strongest precondition the server gave us to a ranged or whole-file request.
+    pub fn guard(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(etag) = &self.etag {
+            builder.header("if-match", etag)
+        } else if let Some(date) = &self.last_modified {
+            builder.header("if-unmodified-since", date)
+        } else {
+            builder
+        }
+    }
+
+    /// Servers may ignore preconditions on range requests, so every response is also
+    /// compared with what the probe saw.
+    pub fn unchanged(&self, response: &Response) -> Result<()> {
+        for (name, known) in [
+            ("etag", &self.etag),
+            ("etag", &self.weak_etag),
+            ("last-modified", &self.last_modified),
+        ] {
+            if let (Some(known), Some(now)) = (known, header(response, name)) {
+                let same = known == now
+                    || (name == "etag"
+                        && known.trim_start_matches("W/") == now.trim_start_matches("W/"));
+                ensure!(
+                    same,
+                    "Remote file changed during the download ({name} is now {now})"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 fn info(response: &Response, size: Option<u64>, ranges: bool) -> Result<Info> {
-    let etag = header(response, "etag")
+    let raw_etag = header(response, "etag");
+    let etag = raw_etag
         .filter(|v| v.starts_with('"') && v.ends_with('"'))
+        .map(str::to_owned);
+    let weak_etag = raw_etag
+        .filter(|v| v.starts_with("W/\""))
+        .map(str::to_owned);
+    let last_modified = header(response, "last-modified")
+        .filter(|v| !v.trim().is_empty())
         .map(str::to_owned);
     let path_name = response
         .url()
@@ -370,6 +433,8 @@ fn info(response: &Response, size: Option<u64>, ranges: bool) -> Result<Info> {
         size,
         ranges,
         etag,
+        weak_etag,
+        last_modified,
         filename: safe_name(disposition.unwrap_or(path_name)),
         content_type: header(response, "content-type").unwrap_or("").to_owned(),
         protocol: format!("{:?}", response.version()),

@@ -253,7 +253,7 @@ if [[ -z "$package_dir" || (! -f "$package_dir/fluxget" && ! -f "$package_dir/bi
     # Default Unix bin is ~/.local/bin; preserve it when handing off to the payload.
     if [[ "$bin_dir" == "$HOME/.local/bin" ]]; then options=(); fi
     if ((!modify_path)); then options+=(--no-modify-path); fi
-    bash "$download_dir/package/install.sh" "${options[@]}"
+    bash "$download_dir/package/install.sh" ${options[@]+"${options[@]}"}
     exit 0
 fi
 

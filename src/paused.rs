@@ -122,7 +122,7 @@ pub fn discover() -> Vec<Paused> {
         .into_iter()
         .filter_map(|output| inspect(&output))
         .collect();
-    found.sort_by(|a, b| b.modified.cmp(&a.modified));
+    found.sort_by_key(|a| std::cmp::Reverse(a.modified));
     // Forget entries that finished or were deleted.
     let _ = write_index(&found.iter().map(|p| p.output.clone()).collect());
     found
@@ -137,11 +137,7 @@ fn describe(item: &Paused) -> String {
         .output
         .parent()
         .map_or_else(String::new, |p| p.display().to_string());
-    let percent = if item.size == 0 {
-        0
-    } else {
-        item.done * 100 / item.size
-    };
+    let percent = (item.done * 100).checked_div(item.size).unwrap_or(0);
     format!(
         "{name}   {percent:>3}%   {} of {}   {folder}",
         ui::bytes(item.done),
@@ -194,6 +190,8 @@ mod tests {
             url: "https://example.org/big.iso".into(),
             size: 10 * 65536,
             etag: Some("\"x\"".into()),
+            weak_etag: None,
+            last_modified: None,
             expected_sha256: None,
             chunk_size: 65536,
             chunks: (0..10).map(|i| (i < 4).then(|| "h".into())).collect(),

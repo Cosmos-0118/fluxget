@@ -249,10 +249,17 @@ and probe traffic; its rate is not a network traffic meter.
 ## Resume and integrity
 
 Real byte-range probes establish support; `Accept-Ranges` alone is not trusted.
-Safe segmentation requires a known length and a **strong ETag**. Servers without
-these receive a single stream. Each chunk uses `If-Match` and exact `Content-Range`
-and length checks. Unexpected compression, changed validators, truncated bodies
-and invalid ranges cannot be published as a successful result.
+Segmentation requires a known length and a working range probe. Every chunk
+carries the strongest precondition the server offers: `If-Match` for a strong
+ETag, otherwise `If-Unmodified-Since` from `Last-Modified`. Responses are also
+compared with the probe, including weak ETags, which are never sent. A server
+that offers none of these (many CDNs) is still downloaded in parallel, but the
+start, middle and end of the file are fetched again and compared with the saved
+bytes before the output is published; resuming does the same for saved chunks.
+Exact `Content-Range` and length checks apply throughout. Unexpected
+compression, changed validators, truncated bodies and invalid ranges cannot be
+published as a successful result. The summary's `validator` field says which
+guard applied (`etag`, `last-modified`, `weak-etag` or `none`).
 
 Interrupted segmented transfers leave files beside the intended output:
 
@@ -261,7 +268,7 @@ Interrupted segmented transfers leave files beside the intended output:
 * `name.fluxget.lock`: a persistent lock file; ownership is an OS lock, not its existence.
 
 Data is flushed before an atomic checkpoint replacement. Resume checks remote
-URL, size, strong ETag and requested checksum, then re-hashes every saved chunk;
+URL, size, validators and requested checksum, then re-hashes every saved chunk;
 damaged chunks are downloaded again. Power-loss durability depends on the OS,
 filesystem and drive honoring flushes; the final output directory publication
 has normal filesystem crash semantics. No hardware power-failure test is claimed.
@@ -277,7 +284,8 @@ The destination appears only after final SHA-256 calculation and optional
 expected-hash verification. Existing outputs are protected unless `--force`
 is set; replacement happens only when the new data verifies. Without an expected
 hash, the printed SHA-256 is a fingerprint, not publisher authentication. A
-strong ETag relies on the server honoring HTTP semantics.
+validator relies on the server honoring HTTP semantics, and the spot check used
+without one detects a replaced file but is no substitute for `--sha256`.
 
 Headers are never stored in resume state; provide `-H` again to resume private
 downloads. Checkpoints store the final URL, including any signed query parameters:

@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
@@ -28,6 +28,9 @@ struct Summary {
     mib_per_second: f64,
     sha256: String,
     strategy: &'static str,
+    /// What guarded the file against changing: etag, last-modified, weak-etag or none
+    /// (spot-checked at three places instead).
+    validator: &'static str,
     peak_connections: usize,
     concurrency_changes: usize,
 }
@@ -130,15 +133,11 @@ async fn fetch_chunk(
     let mut throttled = false;
     for attempt in 0..=retries {
         lane.lane.done.store(0, Ordering::Relaxed);
-        let builder = client
-            .get(&info.url)
-            .header("range", format!("bytes={start}-{end}"))
-            .header(
-                "if-match",
-                info.etag
-                    .as_deref()
-                    .context("Range download requires strong ETag")?,
-            );
+        let builder = info.guard(
+            client
+                .get(&info.url)
+                .header("range", format!("bytes={start}-{end}")),
+        );
         // Header-level retries respect Retry-After. Body failures replay only this chunk.
         let (mut response, was_throttled) = http::request(builder, retries).await?;
         throttled |= was_throttled;
@@ -150,12 +149,7 @@ async fn fetch_chunk(
             )? == (start, end, size),
             "Server returned the wrong Content-Range"
         );
-        if let Some(etag) = http::header(&response, "etag") {
-            ensure!(
-                Some(etag) == info.etag.as_deref(),
-                "Remote ETag changed during download"
-            );
-        }
+        info.unchanged(&response)?;
         let mut data = Vec::with_capacity(expected);
         let mut body_error = None;
         loop {
@@ -202,6 +196,8 @@ fn checkpoint(info: &Info, expected: Option<String>, chunk_size: u64) -> Result<
         url: info.url.clone(),
         size,
         etag: info.etag.clone(),
+        weak_etag: info.weak_etag.clone(),
+        last_modified: info.last_modified.clone(),
         expected_sha256: expected,
         chunk_size,
         chunks: vec![None; count as usize],
@@ -218,6 +214,10 @@ async fn segmented(
     telemetry: &Arc<Telemetry>,
 ) -> Result<(u64, Controller)> {
     let resumed = state::validate_parts(file, state)?;
+    if resumed > 0 && info.etag.is_none() {
+        // Without a strong ETag a remote change between sessions would splice two versions.
+        spot_check(client, info, file, &spans(state)).await?;
+    }
     file.set_len(state.size)?;
     state::save(checkpoint_path, state)?;
     telemetry.resumed.store(resumed, Ordering::Relaxed);
@@ -287,7 +287,87 @@ async fn segmented(
         }
     }
     flush(file, checkpoint_path, state, &mut unsynced)?;
+    if info.etag.is_none() {
+        spot_check(client, info, file, &spans(state)).await?;
+    }
     Ok((resumed, controller))
+}
+
+/// Bytes compared per span when the server has no strong validator.
+const SPOT_BYTES: u64 = 64 * 1024;
+
+/// The start, middle and end of the data saved so far, as `(offset, length)` spans: the
+/// start of the first and middle chunks and the end of the last one.
+fn spans(state: &Checkpoint) -> Vec<(u64, u64)> {
+    let done: Vec<usize> = (0..state.chunks.len())
+        .filter(|&i| state.chunks[i].is_some())
+        .collect();
+    let (Some(&first), Some(&last)) = (done.first(), done.last()) else {
+        return Vec::new();
+    };
+    let bounds = |i: usize| {
+        let start = i as u64 * state.chunk_size;
+        (start, (start + state.chunk_size).min(state.size))
+    };
+    let mut out = Vec::new();
+    for index in [first, done[done.len() / 2]] {
+        let (start, end) = bounds(index);
+        out.push((start, SPOT_BYTES.min(end - start)));
+    }
+    let (start, end) = bounds(last);
+    let len = SPOT_BYTES.min(end - start);
+    out.push((end - len, len));
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A server that sends no ETag or Last-Modified cannot say the file stayed the same, so a few
+/// spans are fetched again and compared with what is on disk. It catches a file replaced
+/// mid-download; it is not a substitute for `--sha256`.
+async fn spot_check(
+    client: &Client,
+    info: &Info,
+    file: &mut File,
+    spans: &[(u64, u64)],
+) -> Result<()> {
+    let size = info.size.context("Spot check requires size")?;
+    for &(start, len) in spans {
+        let end = start + len - 1;
+        let builder = info.guard(
+            client
+                .get(&info.url)
+                .header("range", format!("bytes={start}-{end}")),
+        );
+        let (mut response, _) = http::request(builder, 2).await?;
+        ensure!(
+            response.status() == StatusCode::PARTIAL_CONTENT,
+            "Server stopped honoring ranges during verification"
+        );
+        ensure!(
+            http::range(
+                http::header(&response, "content-range").context("Missing Content-Range")?
+            )? == (start, end, size),
+            "Server returned the wrong Content-Range during verification"
+        );
+        info.unchanged(&response)?;
+        let mut remote = Vec::with_capacity(len as usize);
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                remote.len() + chunk.len() <= len as usize,
+                "Verification body exceeds requested size"
+            );
+            remote.extend_from_slice(&chunk);
+        }
+        let mut local = vec![0u8; len as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut local)?;
+        ensure!(
+            remote == local,
+            "Remote file changed while downloading (bytes {start}-{end} differ); partial data retained, delete the .fluxget.part and .fluxget.json files to restart"
+        );
+    }
+    Ok(())
 }
 
 /// Data reaches stable storage before the journal claims it.
@@ -346,12 +426,7 @@ async fn single(
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         telemetry.received.store(0, Ordering::Relaxed);
-        let builder = client.get(&info.url);
-        let builder = if let Some(etag) = &info.etag {
-            builder.header("if-match", etag)
-        } else {
-            builder
-        };
+        let builder = info.guard(client.get(&info.url));
         let (mut response, _) = tokio::select! {
             _ = &mut cancel => bail!("Interrupted; this server requires a fresh single-stream transfer"),
             result = http::request(builder, tuning.retries) => result?,
@@ -362,12 +437,7 @@ async fn single(
             response.status()
         );
         http::identity(&response)?;
-        if let Some(etag) = http::header(&response, "etag") {
-            ensure!(
-                info.etag.as_deref().is_none_or(|e| e == etag),
-                "Remote ETag changed"
-            );
-        }
+        info.unchanged(&response)?;
         let mut count = 0u64;
         let mut failure = None;
         loop {
@@ -443,14 +513,12 @@ pub async fn download(
     let lock = state::lock(&output)?;
     let part = state::sidecar(&output, ".fluxget.part");
     let checkpoint_path = state::sidecar(&output, ".fluxget.json");
-    // A missing strong validator makes safe range composition impossible.
-    let use_ranges = !tuning.single_stream
-        && info.ranges
-        && info.etag.is_some()
-        && info.size.is_some_and(|n| n > 0);
+    // Ranges need a verified length. Every ranged request carries the strongest precondition
+    // the server offers (ETag, then Last-Modified); a server that offers neither is spot-checked.
+    let use_ranges = !tuning.single_stream && info.ranges && info.size.is_some_and(|n| n > 0);
     let mut journal = if checkpoint_path.exists() {
         let loaded = state::load(&checkpoint_path)?;
-        ensure!(use_ranges && loaded.url == info.url && Some(loaded.size) == info.size && loaded.etag == info.etag && loaded.expected_sha256 == expected,
+        ensure!(use_ranges && loaded.url == info.url && Some(loaded.size) == info.size && loaded.etag == info.etag && loaded.weak_etag == info.weak_etag && loaded.last_modified == info.last_modified && loaded.expected_sha256 == expected,
             "Remote identity or checksum changed; preserve/delete the .fluxget.part and .fluxget.json files, then restart");
         ensure!(
             part.exists(),
@@ -551,6 +619,7 @@ pub async fn download(
         mib_per_second: (bytes - resumed) as f64 / 1048576.0 / elapsed.max(0.000001),
         sha256: hash,
         strategy,
+        validator: info.validator(),
         peak_connections: peak,
         concurrency_changes: changes,
     };
@@ -561,13 +630,19 @@ pub async fn download(
             .output
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let guard_note = match (strategy, summary.validator) {
+            ("single-stream", _) | (_, "etag") => "",
+            (_, "last-modified") => "   ·   guarded by Last-Modified",
+            (_, "weak-etag") => "   ·   guarded by weak ETag, spot-checked",
+            _ => "   ·   server sends no validator, spot-checked",
+        };
         let resumed_note = if resumed > 0 {
             format!("   resumed {}", ui::bytes(resumed))
         } else {
             String::new()
         };
         println!(
-            "\n  \x1b[32m✔\x1b[0m  \x1b[1;97mDownloaded\x1b[0m  {name}\n     \x1b[90m{}\x1b[0m\n     {} in {}   {:.1} MiB/s   up to {} connections{resumed_note}\n     \x1b[90mSHA-256 {}\x1b[0m\n",
+            "\n  \x1b[32m✔\x1b[0m  \x1b[1;97mDownloaded\x1b[0m  {name}\n     \x1b[90m{}\x1b[0m\n     {} in {}   {:.1} MiB/s   up to {} connections{resumed_note}\n     \x1b[90mSHA-256 {}{guard_note}\x1b[0m\n",
             summary.output.display(),
             ui::bytes(bytes),
             ui::duration(elapsed),
@@ -664,6 +739,8 @@ mod tests {
             url: "https://example.com".into(),
             size: 65536,
             etag: Some("\"v1\"".into()),
+            weak_etag: None,
+            last_modified: None,
             expected_sha256: None,
             chunk_size: 65536,
             chunks: vec![Some(state::hash(&vec![5; 65536]))],
