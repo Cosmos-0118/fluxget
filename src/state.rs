@@ -61,35 +61,48 @@ pub fn load(path: &Path) -> Result<Checkpoint> {
 }
 
 pub fn save(path: &Path, state: &Checkpoint) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(temp.as_file_mut(), state)?;
-    temp.as_file_mut().flush()?;
-    temp.as_file().sync_all()?;
+    // A fixed name, so a crash between writing and renaming leaves at most one stray file,
+    // which the next save simply overwrites. The output lock means there is one writer.
+    let temp = sidecar(path, ".tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        // The checkpoint stores the final URL, which may carry a signed token.
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    serde_json::to_writer(&mut file, state)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
     // On Windows an antivirus scanner or a checkpoint reader can briefly hold
     // the old file without FILE_SHARE_DELETE. Retry the same atomic replacement;
     // never remove the previous journal as a workaround.
     for attempt in 0..=8 {
-        match temp.persist(path) {
-            Ok(_) => break,
+        match std::fs::rename(&temp, path) {
+            Ok(()) => break,
             Err(error)
                 if cfg!(windows)
-                    && matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
                     && attempt < 8 =>
             {
-                temp = error.file;
                 std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
             }
-            Err(error) => return Err(error.error.into()),
+            Err(error) => return Err(error.into()),
         }
     }
     // On Unix also persist the directory entry. Windows replacement is atomic,
     // but power-loss durability still depends on the filesystem's rename policy.
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

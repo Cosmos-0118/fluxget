@@ -47,6 +47,11 @@ pub struct Telemetry {
     pub workers: AtomicUsize,
     pub max_workers: usize,
     pub phase: AtomicU8,
+    /// Every byte received this run, never reduced when a chunk is replayed: the engine
+    /// watches it to tell a lost network from a slow one.
+    pub activity: AtomicU64,
+    /// Seconds without any data while the engine waits for the network; 0 when not waiting.
+    pub waiting: AtomicU64,
 }
 
 impl Telemetry {
@@ -68,6 +73,8 @@ impl Telemetry {
             workers: AtomicUsize::new(max_workers),
             max_workers,
             phase: AtomicU8::new(DOWNLOADING),
+            activity: AtomicU64::new(0),
+            waiting: AtomicU64::new(0),
         })
     }
 
@@ -143,6 +150,7 @@ pub(crate) struct Palette {
     pub(crate) bright: &'static str,
     pub(crate) white: &'static str,
     pub(crate) green: &'static str,
+    pub(crate) warn: &'static str,
     pub(crate) bold: &'static str,
     pub(crate) reset: &'static str,
 }
@@ -156,6 +164,7 @@ impl Palette {
                 bright: "",
                 white: "",
                 green: "",
+                warn: "",
                 bold: "",
                 reset: "",
             }
@@ -166,6 +175,7 @@ impl Palette {
                 bright: "\x1b[96m",
                 white: "\x1b[97m",
                 green: "\x1b[32m",
+                warn: "\x1b[33m",
                 bold: "\x1b[1m",
                 reset: "\x1b[0m",
             }
@@ -573,8 +583,14 @@ fn render(t: &Telemetry, st: &mut State, rows: usize, cols: usize) -> Vec<String
         if let Some(total) = t.total {
             meta.put(p.dim, &format!("   ·   {}", bytes(total)));
         }
+        let waiting = t.waiting.load(Relaxed);
         if verifying {
             meta.put(p.dim, "   ·   download complete");
+        } else if waiting > 0 {
+            meta.put(p.dim, "   ·   ").put(
+                p.warn,
+                &format!("waiting for the network ({})", duration(waiting as f64)),
+            );
         } else if chunks > 0 {
             meta.put(
                 p.dim,
@@ -859,6 +875,14 @@ fn enable_ansi() -> bool {
 #[cfg(not(windows))]
 fn enable_ansi() -> bool {
     true
+}
+
+/// Shows the cursor again after the display was cut short, for example when the process is
+/// told to stop while it is still drawing.
+pub fn restore_terminal() {
+    if Term::stderr().is_term() {
+        write_err("\r\x1b[?25h\n");
+    }
 }
 
 fn write_err(text: &str) {

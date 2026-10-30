@@ -25,6 +25,11 @@ class Origin(http.server.ThreadingHTTPServer):
         # Shared bandwidth reservation clock for the optional aggregate cap.
         self.agg_clock = 0.0
         self.chunk_requests = 0
+        # /outage: connections are dropped until this monotonic time.
+        self.outage_until = 0.0
+        self.outage_requests = 0
+        self.truncated = set()
+        self.seen = []
 
     @property
     def url(self):
@@ -131,6 +136,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             attempt = self.server.hits[key]
         # Probes always succeed; actual chunks can experience failures.
         actual_chunk = ranged and end > start
+        if actual_chunk:
+            self.server.seen.append((route, start))
+        if route == "/outage":
+            # The (after+1)th chunk request starts an outage lasting `down` seconds: every
+            # connection is closed without an answer until it is over, like a dropped link.
+            now = time.monotonic()
+            with self.server.guard:
+                if actual_chunk:
+                    self.server.outage_requests += 1
+                    if self.server.outage_requests == int(query.get("after", [3])[0]) + 1:
+                        self.server.outage_until = now + float(query.get("down", [5])[0])
+                dropped = now < self.server.outage_until
+            if dropped:
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
         if actual_chunk and route == "/rate" and attempt == 1:
             self.send_response(429)
             self.send_header("Retry-After", "1")
@@ -171,7 +192,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             reported_start = start + 1 if actual_chunk and route == "/badrange" else start
             self.send_header("Content-Range", f"bytes {reported_start}-{end}/{size}")
         self.end_headers()
-        if actual_chunk and route in ("/truncate", "/always-truncate") and (attempt == 1 or route == "/always-truncate"):
+        # /truncate cuts the first request for each chunk short; a request that continues the chunk
+        # afterwards (same end) is served in full.
+        first_cut = False
+        if actual_chunk and route == "/truncate":
+            with self.server.guard:
+                first_cut = (route, end) not in self.server.truncated
+                self.server.truncated.add((route, end))
+        if actual_chunk and (first_cut or route == "/always-truncate"):
             data = payload(min(length, 1024))
             self.wfile.write(data)
             self.wfile.flush()

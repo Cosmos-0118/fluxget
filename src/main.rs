@@ -7,6 +7,7 @@ mod mediaui;
 mod paused;
 mod picker;
 mod resolver;
+mod shutdown;
 mod sites;
 mod state;
 mod ui;
@@ -86,8 +87,9 @@ pub struct Network {
     /// HTTP/SOCKS proxy; environment HTTP_PROXY/HTTPS_PROXY are also supported
     #[arg(long)]
     proxy: Option<String>,
-    /// Per-request timeout, including body transfer
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    /// Seconds without any data before a request counts as stalled and is retried; a long
+    /// transfer that keeps receiving data is never cut off
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=86400))]
     timeout: u64,
     /// Let yt-dlp use the sign-in cookies of a browser (chrome, firefox, safari, edge, ...) for
     /// media pages that ask you to confirm you are not a bot
@@ -112,6 +114,9 @@ pub struct Tuning {
     /// Retries per request after the initial attempt
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=10))]
     retries: u8,
+    /// Seconds to keep waiting for a lost network before giving up (0: fail once retries run out)
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(0..=86400))]
+    patience: u64,
     /// Write one machine-readable result to stdout; suppress progress
     #[arg(long)]
     json: bool,

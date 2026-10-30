@@ -1,368 +1,299 @@
+<div align="center">
+
+<img src="docs/images/live.png" alt="fluxget downloading a 1 GiB file with live per-connection lanes and a chunk map" width="100%" />
+
+<br />
+
 # fluxget
 
-An adaptive, integrity-first download accelerator for Windows, macOS, and Linux.
-Native Rust HTTP(S) engine; optional **aria2** and **yt-dlp** commands reuse mature
-open-source implementations for torrents, Metalink, FTP/SFTP and media websites.
+**Adaptive, integrity-first download accelerator for Windows, macOS and Linux.**
+Paste a link, a repo, a magnet or a video page. fluxget finds the file, downloads it in parallel, and proves it arrived intact.
 
-This is version **0.2.0**. Release packages are built and tested on Windows,
-macOS (Apple Silicon and Intel), and Linux, for x86_64 and aarch64 where available.
+[![CI](https://img.shields.io/github/actions/workflow/status/Cosmos-0118/fluxget/ci.yml?branch=main&label=build&style=flat-square)](https://github.com/Cosmos-0118/fluxget/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Cosmos-0118/fluxget?include_prereleases&style=flat-square&color=4FFFB0&labelColor=171717)](https://github.com/Cosmos-0118/fluxget/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D4?style=flat-square)
+![Rust](https://img.shields.io/badge/Rust-1.91%2B-DEA584?style=flat-square&logo=rust&logoColor=white)
 
-## Install once, update with the same command
+[Install](#install) ·
+[Usage guide](docs/usage.md) ·
+[Resume and integrity](docs/integrity.md) ·
+[Development](docs/development.md) ·
+[Report a bug](https://github.com/Cosmos-0118/fluxget/issues)
 
-No Rust, Python, admin account, or compiler is required for prebuilt releases.
-The installer automatically selects your OS and CPU, downloads the latest
-release, checks its SHA-256, verifies the executable, and installs it for your
-user account. Open a new terminal after installation and run `fluxget --help`.
+</div>
 
-**Windows — paste into PowerShell:**
+---
+
+## Why fluxget
+
+Browsers download a file over one connection and call it done. Download managers add speed but rarely tell you whether the bytes are right. fluxget is a single small binary that does both: it splits a download into chunks, tunes how many run at once while it measures the real throughput, and refuses to publish a file it cannot verify.
+
+- **Fast, without guessing.** An adaptive controller starts small, grows while throughput improves and backs off when the server pushes back. `--fixed` and `-j` give you manual control up to 32 workers.
+- **Integrity first.** Resume checks the server's validators and re-hashes saved chunks. The output only appears after the final SHA-256, and `--sha256` makes a mismatch a hard failure.
+- **Understands where files live.** Paste a GitHub repo, a Hugging Face model, a SourceForge project, an archive.org item or a Drive link and pick the file you want. Published hashes are verified automatically.
+- **Resumable and resilient.** Interrupt at any point, or lose the network: fluxget saves its progress, waits for the connection to return and continues where it stopped. After a crash, `fx resume` lists everything that is paused and carries on from the verified chunks.
+- **Scriptable.** `--json`, `--quiet`, stable exit codes and a non-interactive `resolve` command for pipelines.
+- **One installer, same command to update.** No Rust, Python or admin rights required.
+
+## Features
+
+| | |
+| --- | --- |
+| **Parallel engine** | Native Rust HTTP(S) with HTTP/2, bounded dynamic chunk scheduling, retries with backoff and `Retry-After`, proxies (HTTP and SOCKS) and custom headers. |
+| **Adaptive workers** | Starts at four, measures throughput every 500 ms, grows by 1.5x while it helps and rolls back when it does not. Default ceiling 16, configurable to 32. |
+| **Live display** | An overall bar with speed, ETA and a throughput sparkline, one lane per connection and a map of every chunk. Adapts to the window and disappears when the transfer ends. |
+| **Smart resolver** | Reads a page for file links, `download` attributes, `<video>` sources and redirects. Multiple candidates open an arrow-key picker with your OS and CPU preselected. |
+| **Source adapters** | GitHub, GitLab, Codeberg/Gitea/Forgejo, Hugging Face, SourceForge, archive.org, Google Drive, Dropbox, OneDrive, Pixeldrain and VS Code. |
+| **Validated resume** | Byte-range probes, `If-Match` or `If-Unmodified-Since` on every chunk, atomic checkpoints and per-chunk SHA-256. |
+| **Network recovery** | Continues a broken chunk from the byte where it stopped, waits out connection loss (`--patience`, default 5 minutes) and saves progress on Ctrl-C, `SIGTERM` or a closing terminal. |
+| **Torrents and media** | Magnet links and `.torrent` files go to [aria2](https://aria2.github.io/); YouTube and similar sites go to [yt-dlp](https://github.com/yt-dlp/yt-dlp). |
+| **Folder picker** | Choose where each download goes with the system folder dialog, or let it land in your Downloads folder. |
+| **Cross-platform** | Prebuilt packages for Windows, macOS and Linux on x86_64 and aarch64. |
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/picker.png" alt="Arrow-key picker listing five downloads found on a page" /><br />
+      <sub><b>Pick from a page.</b> Your OS and CPU is highlighted.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/done.png" alt="Download finished summary with size, speed and SHA-256" /><br />
+      <sub><b>Verified result.</b> Size, speed, connections and SHA-256.</sub>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/resume.png" alt="fx resume listing two paused downloads" /><br />
+      <sub><b>Resume anything.</b> <code>fx resume</code> finds every paused download.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/doctor.png" alt="fluxget doctor showing aria2, yt-dlp and curl versions" /><br />
+      <sub><b>Doctor.</b> Shows which optional backends are installed.</sub>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/images/outage.png" alt="Download paused with the message waiting for the network" width="70%" /><br />
+      <sub><b>Connection lost?</b> fluxget keeps its progress, waits, and carries on when the network returns.</sub>
+    </td>
+  </tr>
+</table>
+
+<sub>Screenshots are real runs of the current build against a local loopback test server, so the host reads 127.0.0.1 and the speeds are not an internet measurement.</sub>
+
+## Install
+
+No Rust, Python or admin account is needed. The installer picks your OS and CPU, downloads the latest release, checks its SHA-256, verifies the executable and installs it for your user. Open a new terminal afterwards and run `fluxget --help`.
+
+**Windows (PowerShell):**
 
 ```powershell
 irm https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.ps1 | iex
 ```
 
-**macOS or Linux — paste into Terminal:**
+**macOS or Linux (Terminal):**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.sh | bash
 ```
 
-In a terminal the installer shows a live step list with a flowing wave and a
-progress bar (size, speed). Piped or CI output gets plain `[n/total]` lines; set
-`FLUXGET_PLAIN=1` to force that, `FLUXGET_ASCII=1` for ASCII-only glyphs, or
-`NO_COLOR=1` to drop colour.
+> [!TIP]
+> **Already installed? Run the same command again to update.** A failed download, checksum or version check leaves your current binary untouched, and your downloads and resume checkpoints are preserved.
 
-Prefer clicking? Download the matching ZIP from
-[Releases](https://github.com/Cosmos-0118/fluxget/releases/latest), extract it,
-then double-click **Install.cmd** on Windows or **Install.command** on macOS.
-If macOS blocks the unsigned installer, use the Terminal command above.
-Linux packages also include `install.sh`. Packages contain license notices and
-both an archive checksum and an internal executable checksum. Checksums detect
-corruption; they rely on the trusted GitHub release as the source.
+Prefer clicking? Download a package from [Releases](https://github.com/Cosmos-0118/fluxget/releases/latest), extract it and double-click **Install.cmd** (Windows) or **Install.command** (macOS). Custom directories and pinned versions are in [docs/installation.md](docs/installation.md). To build from source see [Build from source](#build-from-source).
 
-**Already installed? Run the same command again to update.** An identical binary
-is left in place; a changed binary replaces the existing installation only after
-verification. A failed download, checksum or version check leaves the old binary
-intact. PATH entries are not duplicated. Downloads and resume checkpoints are
-preserved; updating does not uninstall your data or create another installation.
-An explicitly selected older release can also replace the installed version.
+The installer also adds **`fx`**, a short alias: `fx https://example.org/archive.zip` works the same as `fluxget`.
 
-Default locations: `%LOCALAPPDATA%\Programs\fluxget\bin` on Windows and
-`~/.local/bin` on macOS/Linux. Windows updates the user PATH; Unix updates shell
-profiles for bash/zsh. Restart your terminal after installation or updates.
-Installation from an extracted archive uses that archive's version; the online
-command always fetches the latest published release.
-
-For a custom directory or a pinned version:
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.ps1))) -Version v0.1.0 -InstallDir "$env:LOCALAPPDATA\Programs\fluxget"
-```
+## Use it
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Cosmos-0118/fluxget/main/install.sh | bash -s -- --version v0.1.0 --prefix "$HOME/apps/fluxget"
+fluxget https://example.org/archive.zip                      # download to your Downloads folder
+fluxget https://example.org/archive.zip -o downloads/a.zip   # choose the output
+fluxget https://example.org/archive.zip --sha256 <hash>      # fail unless the hash matches
+fluxget github.com/BurntSushi/ripgrep                        # pick a release asset, hash-verified
+fluxget https://huggingface.co/org/model                     # pick a model file
+fluxget 'magnet:?xt=urn:btih:...' -o ~/torrents              # torrent via aria2
+fluxget https://www.youtube.com/watch?v=ID -o ~/videos       # video via yt-dlp
+fluxget inspect https://example.org/archive.zip              # probe ranges, size and validators
+fluxget resume                                               # pick a paused download to continue
 ```
 
-Extracted-package options: `powershell -ExecutionPolicy Bypass -File install.ps1
--InstallDir C:\Tools\fluxget -NoModifyPath` or `bash install.sh --prefix
-"$HOME/apps/fluxget" --no-modify-path`. The no-modify option leaves PATH/profile
-settings unchanged. Running an installer from a source checkout uses its local
-binary, or builds it if the prerequisites below are available.
+**Where files go.** Without `-o`, a terminal run asks where to save, with your Downloads folder preselected or the system folder picker one keypress away. Piped, `--json` and `--quiet` runs skip the question. A name already taken becomes `name (1).ext` unless you pass `--force`.
 
-## Build and install
+**Scripting.** `--json` prints one result object with the strategy, SHA-256, elapsed time and peak worker count. `fluxget resolve URL --json` lists candidates with a stable order and `--select N` chooses one, so it never needs a terminal.
 
-Install [Rust 1.91 or newer](https://rustup.rs). Windows also needs the Visual
-Studio C++ Build Tools; macOS needs Xcode command line tools. Linux needs a C
-compiler and standard build tools. TLS uses rustls, so OpenSSL is not required.
-
-```sh
-cargo install --path . --locked
-fluxget --help
-fluxget doctor
-```
-
-Or build a portable executable with `cargo build --release --locked`. The binary
-is `target/release/fluxget` (`fluxget.exe` on Windows). Run it directly or put it
-on PATH. Python 3.10+ is needed only for the test/benchmark scripts.
-
-## Download
-
-```sh
-fluxget https://example.org/archive.zip
-fluxget https://example.org/archive.zip -o downloads/archive.zip
-fluxget https://example.org/archive.zip --sha256 <64-hex-digit-hash>
-fluxget inspect https://example.org/archive.zip
-fluxget resolve https://example.org/downloads
-fluxget resume downloads/archive.zip
-```
-
-The installer also adds **`fx`**, a two-letter copy of the command, so
-`fx https://example.org/archive.zip` works the same. An unrelated program already
-named `fx` in the install folder is never replaced.
-
-**Where files go.** Without `-o`, downloads are saved in your **Downloads
-folder**. In a terminal, fluxget asks first: *Downloads* is preselected, or choose
-*Pick a folder...* to open the system folder picker (Windows file dialog, macOS
-Finder, zenity/kdialog on Linux, or a typed path when no dialog is available).
-Piped, `--json` and `--quiet` runs skip the question and use Downloads; `-o`
-always wins and also skips it. A name already taken becomes `name (1).ext`, like
-a browser (use `--force` to replace). Set `FLUXGET_DOWNLOAD_DIR` to change the
-default folder.
-
-**Live display.** In a terminal a download shows the file, an overall bar with
-speed, ETA and a throughput sparkline, one lane per connection (which chunk each
-is fetching and how far along), and a map of every chunk (done, downloading,
-waiting). It adapts to the window size and disappears when the download ends;
-`--quiet`, `--json` and piped output stay plain.
-
-**Resuming.** `fx resume` with no name lists every paused download (found in the
-Downloads folder, the current folder, and the ones fluxget remembers) so you can
-pick one with the arrow keys. `fx resume <output>` still resumes a specific file.
-
-`fluxget winget install <package>` runs the Windows Package Manager with the same
-arguments, so one tool covers both file downloads and app installs.
-
-Quote URLs containing `&` or shell special characters. `get URL` and bare `URL`
-are equivalent. A page with multiple downloads opens an **arrow-key picker**:
-use **Up/Down**, **Enter** to download, or **Esc** to cancel. A likely OS/CPU match
-is highlighted; you can choose another platform. One candidate is selected
-automatically unless you add `--pick`. `--direct` saves the actual HTTP response,
-including HTML when desired.
-
-```sh
-fluxget https://code.visualstudio.com/
-fluxget https://example.org/downloads --pick
-fluxget resolve https://code.visualstudio.com/
-fluxget https://example.org/downloads --select 2 --json
-```
-
-The resolver detects file links, download attributes, query-string filenames,
-download URL attributes, `<video>`/`<audio>` sources, social-preview video tags,
-base64-obfuscated download buttons and meta-refresh redirects. It follows up to
-three same-origin download indexes one level below the starting page (fetched
-concurrently), with a 2 MiB/page and 200-candidate limit. Candidates keep page
-order. Page scripts are never run. A pasted `github.com/o/r` without a scheme
-works (HTTPS, or HTTP for localhost).
+The full option reference, source details, tuning and error behaviour are in the [usage guide](docs/usage.md).
 
 ## Supported sources
 
-The sites people most often download from have dedicated support. Listings use
-the sites' documented public APIs, so no scraping or login is involved, and the
-published SHA-256 is verified automatically whenever the site provides one.
+Listings use each site's documented public API, so there is no scraping or login. A published SHA-256 is verified automatically whenever the site provides one.
 
 | Source | What you can paste | Result |
-|---|---|---|
-| **GitHub** (and GitHub Enterprise via `FLUXGET_GITHUB_URL`) | repo, `/releases`, `/releases/latest`, `/releases/tag/T`, `/blob/...`, `/tree/REF` | release assets with **verified digests**, source archives, raw file |
-| **GitLab**, **Codeberg/Gitea/Forgejo** | `/-/releases`, `/releases`, `/releases/tag/T`, repo root on gitlab.com/codeberg.org | release assets and source archives |
-| **Hugging Face** | model/dataset page, `/tree/REV/dir`, `/blob/...` | every file; LFS files carry **verified SHA-256** |
+| --- | --- | --- |
+| **GitHub** (and Enterprise) | repo, `/releases`, `/releases/latest`, a tag, `/blob/...`, `/tree/REF` | release assets with **verified digests**, source archives, raw files |
+| **GitLab**, **Codeberg/Gitea/Forgejo** | releases pages or the repo root | release assets and source archives |
+| **Hugging Face** | model or dataset page, `/tree`, `/blob` | every file, LFS files with **verified SHA-256** |
 | **SourceForge** | project page | best release per platform, **verified SHA-256** |
 | **archive.org** | `/details/ID` | original files first, then derivatives |
-| **Google Drive / Docs**, **Dropbox**, **OneDrive**, **Pixeldrain** | public file share links | direct download; Docs/Sheets/Slides offer DOCX/XLSX/PPTX/PDF |
-| **Torrent sites and files** | magnet links, `.torrent` URLs or files, pages with either | downloaded with aria2 (below) |
-| **Video and audio pages** | YouTube, Vimeo, X/Twitter, Instagram, TikTok, Reddit, Twitch, SoundCloud, Bandcamp, and similar | downloaded with yt-dlp (below) |
-| **VS Code** | `code.visualstudio.com` | all 25 official builds, listed instantly |
+| **Google Drive / Docs**, **Dropbox**, **OneDrive**, **Pixeldrain** | public share links | direct download, Docs offer DOCX/XLSX/PPTX/PDF |
+| **Torrents** | magnet links, `.torrent` URLs or files, pages with either | downloaded with aria2 |
+| **Video and audio pages** | YouTube, Vimeo, X, Instagram, TikTok, Reddit, Twitch, SoundCloud, Bandcamp and more | downloaded with yt-dlp |
+| **VS Code** | `code.visualstudio.com` | all official builds, listed instantly |
 
-Not possible natively: MEGA (end-to-end encrypted; use MEGAcmd), Google Drive
-folders, private repositories or files behind a login (`-H 'Authorization: ...'`
-helps for token-based sites). OneDrive support covers public single-file shares
-and relies on Microsoft's shares API.
+Not possible natively: MEGA (end-to-end encrypted), Google Drive folders, and anything behind a login. See the [usage guide](docs/usage.md#supported-sources) for tokens, rate limits and caveats.
 
-GitHub's unauthenticated API allows 60 requests an hour per address; set
-`GITHUB_TOKEN` (or `GH_TOKEN`) for 5000. When the limit is hit fluxget falls
-back to the release page itself (still no login, but without digests). Other
-optional tokens: `GITLAB_TOKEN`, `GITEA_TOKEN`, `HF_TOKEN` (gated models).
+## How it works
 
-```sh
-fluxget github.com/BurntSushi/ripgrep              # pick a release asset
-fluxget https://github.com/o/r/releases/latest --select 3 --json
-fluxget https://huggingface.co/org/model            # pick a model file, hash-verified
-fluxget 'magnet:?xt=urn:btih:...' -o ~/torrents     # torrent via aria2
-fluxget https://tracker.example/torrent/123         # page with magnet/.torrent links
-fluxget https://www.youtube.com/watch?v=ID -o ~/videos
+```mermaid
+flowchart LR
+    A[URL, repo, magnet<br/>or page] --> B[Resolver]
+    B -->|file found| C[Range probe]
+    B -->|torrent| E[aria2]
+    B -->|video page| F[yt-dlp]
+    C --> D[Adaptive chunk<br/>scheduler]
+    D --> G[Checkpointed<br/>.part file]
+    G --> H[SHA-256 verified<br/>output]
+    E --> H
+    F --> H
 ```
 
-### Torrents and media
+- **Probe first.** A real byte-range request decides whether the file can be segmented. `Accept-Ranges` alone is not trusted.
+- **Adaptive, not reckless.** Workers grow only while measured throughput improves, and shrink on throttling. The number of chunks bounds useful workers, so a small file never opens thousands of requests.
+- **Guarded chunks.** Every chunk carries the strongest precondition the server offers (`If-Match` or `If-Unmodified-Since`). Servers with neither get their start, middle and end re-fetched and compared before the file is published.
+- **Safe publish.** Progress lives in `name.fluxget.part` and a versioned `name.fluxget.json` checkpoint. The final file appears only after the SHA-256 is computed and, if you gave one, checked.
 
-BitTorrent and video sites are delegated to [aria2](https://aria2.github.io/) and
-[yt-dlp](https://github.com/yt-dlp/yt-dlp), which must be installed (`fluxget
-doctor` shows what is found). Fluxget detects magnet links and `.torrent` files
-(by link, file name or `application/x-bittorrent` content type), fetches `.torrent`
-files itself with your proxy and headers, rejects HTML posing as a torrent, and
-hands over a clean argument vector. For these two kinds `-o` names a *directory*,
-torrents stop seeding when complete (`--seed-minutes N` to keep seeding), YouTube
-URLs download one item, not the playlist, and with `--json` the tool's output
-goes to stderr so stdout is a single JSON result. Piece hashing, peers, resume
-and merging streams belong to those tools; `--direct` saves a `.torrent` file itself.
-Custom `-H` headers are not forwarded to them, and BitTorrent peer traffic does
-not use `--proxy`.
+The details, including the checkpoint format and failure behaviour, are in [Resume and integrity](docs/integrity.md).
 
-For scripts, `resolve` returns JSON with stable 1-based ordering. Use `--select N`
-to choose a candidate. Non-interactive input and `--json` never open a picker;
-ambiguous pages return the numbered choices and an actionable error. A download
-landing page can be resolved further after selection, up to four page levels.
+### Benchmarks
 
-```sh
-fluxget https://example.org/file.iso -j 16
-fluxget https://example.org/file.iso --fixed -j 8
-fluxget https://example.org/file.iso --single-stream
-fluxget https://example.org/private.zip -H 'Authorization: Bearer TOKEN'
-fluxget https://example.org/file.iso --proxy socks5h://127.0.0.1:1080
-fluxget https://example.org/file.iso --json
-```
+Measured on a Windows 11 machine against a deterministic loopback server, with SHA-256 checked on every output. This scenario gives each connection a synthetic 4 MiB/s cap, like a server that throttles single streams.
 
-Default settings: maximum sixteen requests; adaptive mode starts at four,
-measures bytes as they arrive every 500 ms, multiplies workers by 1.5 while
-throughput improves by more than 10%, rolls back after two flat samples and
-re-probes ten samples later, and halves its target after observed throttling.
-Already-running requests finish when the target falls. `--fixed` disables
-throughput exploration; rate-limit responses can still reduce concurrency.
-This controller is a heuristic, not a proof of the optimal connection count.
-Small files can finish before it learns much. HTTP/2 multiplexes requests, so
-worker count is not necessarily TCP connection count. Replacement requests start
-before the previous chunk is written, and chunk data is synced and checkpointed
-about once a second instead of after every chunk, so a slow disk does not idle
-the connections; the checkpoint still only lists synced chunks.
+| Tool | Median MiB/s |
+| --- | ---: |
+| curl (single connection) | 4.00 |
+| fluxget `--single-stream` | 3.98 |
+| fluxget adaptive (default) | 10.53 |
+| fluxget `--fixed -j 8` | 30.17 |
+| aria2 `-x8` | 30.92 |
 
-There is **no download-speed cap** in fluxget. Sixteen is the default worker
-ceiling, configurable with `-j` up to 32, for example `fluxget URL -j 32`.
-Files advertise byte-range support, not an optimal number of workers. The
-number of chunks bounds useful tasks; bandwidth, server limits, latency, CPU
-and disk determine whether extra workers improve throughput. A worker-per-chunk
-policy can open thousands of requests without adding bandwidth. The controller
-therefore measures performance within the chosen ceiling. Native aggregate
-bandwidth limiting is not implemented.
+Loopback is not an internet speed test, small files finish before the controller learns much, and with no per-connection cap curl is faster on loopback. No universal speedup is claimed. The raw runs, commands and caveats are in [docs/BENCHMARK_WINDOWS.md](docs/BENCHMARK_WINDOWS.md).
 
-`--chunk-kib` defaults to 2048 (allowed 64–16384). Application body buffers are
-bounded by maximum workers × chunk size, plus library buffers. Network retries
-default to four after the first attempt; `--timeout` defaults to 60 seconds per
-request. Change it for slow large single-stream downloads. `429`, `502`, `503`,
-`504` and connection failures retry with exponential backoff; `Retry-After`
-seconds and HTTP dates are honored. Truncated range bodies replay their chunk.
-Other HTTP errors fail immediately. Body retries and header retries have separate
-budgets, so one chunk can make up to `(retries + 1)^2` attempts in the worst case.
+## Architecture
 
-`--json` emits one final JSON result to stdout; errors go to stderr and return
-exit code 1 (CLI usage errors return 2). Output includes strategy, SHA-256,
-elapsed time, verified resumed bytes, and peak worker target. `transferred_bytes`
-counts successfully committed bytes this invocation, excluding retried bytes
-and probe traffic; its rate is not a network traffic meter.
+| Area | Source | What it does |
+| --- | --- | --- |
+| CLI and commands | [`src/main.rs`](src/main.rs) | Argument parsing and the `get`, `resume`, `inspect`, `resolve`, `doctor`, `aria2`, `media` and `winget` commands. |
+| Download engine | [`src/engine.rs`](src/engine.rs) | Chunk scheduling, adaptive worker control, retries and verification. |
+| HTTP layer | [`src/http.rs`](src/http.rs) | Probes, redirects, proxies and range requests. |
+| Resume state | [`src/state.rs`](src/state.rs), [`src/paused.rs`](src/paused.rs) | Checkpoints, locks and the list of paused downloads. |
+| Resolver and sources | [`src/resolver.rs`](src/resolver.rs), [`src/sites.rs`](src/sites.rs), [`src/forges.rs`](src/forges.rs) | Page scanning, URL recognition and release-API adapters. |
+| Terminal UI | [`src/ui.rs`](src/ui.rs), [`src/picker.rs`](src/picker.rs), [`src/location.rs`](src/location.rs) | Live display, arrow-key picker and the save-location prompt. |
+| Backends | [`src/backends.rs`](src/backends.rs) | Argument-vector delegation to aria2 and yt-dlp. No shell is ever involved. |
 
-## Resume and integrity
+## Build from source
 
-Real byte-range probes establish support; `Accept-Ranges` alone is not trusted.
-Segmentation requires a known length and a working range probe. Every chunk
-carries the strongest precondition the server offers: `If-Match` for a strong
-ETag, otherwise `If-Unmodified-Since` from `Last-Modified`. Responses are also
-compared with the probe, including weak ETags, which are never sent. A server
-that offers none of these (many CDNs) is still downloaded in parallel, but the
-start, middle and end of the file are fetched again and compared with the saved
-bytes before the output is published; resuming does the same for saved chunks.
-Exact `Content-Range` and length checks apply throughout. Unexpected
-compression, changed validators, truncated bodies and invalid ranges cannot be
-published as a successful result. The summary's `validator` field says which
-guard applied (`etag`, `last-modified`, `weak-etag` or `none`).
-
-Interrupted segmented transfers leave files beside the intended output:
-
-* `name.fluxget.part`: partial data, possibly pre-sized to the final length.
-* `name.fluxget.json`: versioned identity and SHA-256 of completed chunks.
-* `name.fluxget.lock`: a persistent lock file; ownership is an OS lock, not its existence.
-
-Data is flushed before an atomic checkpoint replacement. Resume checks remote
-URL, size, validators and requested checksum, then re-hashes every saved chunk;
-damaged chunks are downloaded again. Power-loss durability depends on the OS,
-filesystem and drive honoring flushes; the final output directory publication
-has normal filesystem crash semantics. No hardware power-failure test is claimed.
-
-Single-stream transfers restart from zero after interruption. For those, repeat
-the original URL command. `resume <output>` requires a segmented checkpoint.
-On changed remote identity, move or delete **both** partial and checkpoint files
-and start again. A requested hash mismatch retains the partial/checkpoint and
-does not publish the output. Repeating the same expected hash cannot repair a
-server consistently serving incorrect content; obtain the correct URL/hash.
-
-The destination appears only after final SHA-256 calculation and optional
-expected-hash verification. Existing outputs are protected unless `--force`
-is set; replacement happens only when the new data verifies. Without an expected
-hash, the printed SHA-256 is a fingerprint, not publisher authentication. A
-validator relies on the server honoring HTTP semantics, and the spot check used
-without one detects a replaced file but is no substitute for `--sha256`.
-
-Headers are never stored in resume state; provide `-H` again to resume private
-downloads. Checkpoints store the final URL, including any signed query parameters:
-keep them private. Expired signed URLs require a fresh download identity. Custom
-headers cannot cross origins via redirects; HTTPS downgrades are blocked. The
-native resolver does not log in, execute JavaScript, bypass access controls, or
-silently select between multiple files.
-
-## Reuse existing tools
-
-Install [aria2](https://aria2.github.io/) and/or
-[yt-dlp](https://github.com/yt-dlp/yt-dlp) independently and add them to PATH.
-`fluxget doctor` reports their availability. All trailing arguments pass directly
-to the tool as process arguments; no shell command is constructed.
+Install [Rust 1.91 or newer](https://rustup.rs). Windows also needs the Visual Studio C++ Build Tools and macOS needs the Xcode command line tools. TLS uses rustls, so OpenSSL is not required.
 
 ```sh
-fluxget aria2 -x8 -s8 -k1M https://example.org/file.iso
-fluxget aria2 https://example.org/image.meta4
-fluxget aria2 'magnet:?xt=urn:btih:...'
-fluxget media --no-playlist 'https://supported-media-site.example/video'
+git clone https://github.com/Cosmos-0118/fluxget.git
+cd fluxget
+cargo install --path . --locked
+fluxget doctor
 ```
 
-These are explicit delegation commands. Fluxget does not claim its own adaptive
-scheduler or checkpoint format applies to external tools. aria2 owns its own
-resume, mirror, checksum and torrent semantics. yt-dlp may need ffmpeg or other
-dependencies for selected sites. Backend exit failures propagate as fluxget
-errors. See [research notes](docs/RESEARCH.md) for alternatives and decisions.
+Or build a portable binary with `cargo build --release --locked`; it lands in `target/release/fluxget`.
 
-## Test and benchmark locally
+### Test
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo build --release --locked
 python scripts/integration.py --binary target/release/fluxget
-python scripts/test_sources.py --binary target/release/fluxget
-python scripts/test_picker.py --binary target/release/fluxget
-python scripts/benchmark.py --binary target/release/fluxget --runs 3
-python scripts/package.py
-python scripts/test_installers.py
 ```
 
-`test_sources.py` needs `rustc` (it builds a recording stand-in for aria2c and
-yt-dlp) and runs GitHub-, GitLab- and Gitea-style APIs, torrent pages and landing
-pages on loopback; no external tools or internet are required. Append `.exe` to
-the binary path on Windows. `--aria2 /path/to/aria2c` adds the
-aria2 comparison if it is not on PATH. The benchmark automatically includes curl
-when available. It writes JSON with exact commands and raw repetitions, plus a
-Markdown table, into `bench-results/`. It uses a loopback fixture, deterministic
-content, randomized trial order, an untimed warm-up and SHA-256 verification of
-every result. Cases cover unrestricted transfers, synthetic per-connection caps,
-and servers ignoring ranges. Temporary payloads are removed automatically.
+The integration scripts run against loopback servers, so no internet or external tools are required. The full list, including benchmarks and packaging, is in [docs/development.md](docs/development.md).
 
-Only the test server applies the synthetic per-connection cap. The downloader
-itself does not impose that cap; the unrestricted scenario has no rate limit.
+## Documentation
 
-The measured outcome depends on file size, request latency, bandwidth policy,
-disk, checksum work, and checkpoint flush overhead. Loopback is not an internet
-speed test. Curl and aria2 use different durability and hash policies; the
-end-to-end comparison exposes those practical costs. No universal speedup is
-claimed. See [the recorded Windows results](docs/BENCHMARK_WINDOWS.md).
+| Guide | Contents |
+| --- | --- |
+| [Usage guide](docs/usage.md) | Every option, source adapters, torrents and media, tuning and JSON output. |
+| [Installation](docs/installation.md) | Custom directories, pinned versions, updates and package options. |
+| [Resume and integrity](docs/integrity.md) | Probes, validators, checkpoints and what is verified. |
+| [Development](docs/development.md) | Building, tests, benchmarks and packaging. |
+| [Research notes](docs/RESEARCH.md) | Alternatives considered and the decisions made. |
+| [Windows benchmark](docs/BENCHMARK_WINDOWS.md) | Recorded results and methodology. |
 
-## Scope and next work
+## Roadmap
 
-Working now: native HTTP(S), redirects, public static HTML candidates, bounded
-dynamic chunk scheduling, adaptive/fixed workers, validated resume, integrity,
-progress/JSON output, proxies/headers, arrow-key download selection, release and
-file-listing adapters (GitHub, GitLab, Gitea, Hugging Face, SourceForge,
-archive.org), cloud share links, automatic torrent/magnet and media-page
-delegation, and a VS Code page adapter.
+Working now: native HTTP(S), validated resume, adaptive workers, the live display, source adapters, cloud share links and torrent and media delegation.
 
-Future work: independent mirror identity proofs and native mirror striping,
-browser extension/native messaging, batch scheduling, aggregate rate limiting,
-cookie jars, login-gated sites, JavaScript-rendered listings (torrent search
-results, single-page download sites), a native BitTorrent engine, a richer terminal interface, and broader
-real-WAN benchmarks. Browser integration is deliberately a later milestone.
+Planned: native mirror striping, batch scheduling, aggregate rate limiting, cookie jars and login-gated sites, JavaScript-rendered listings, a native BitTorrent engine and a browser extension.
 
-MIT licensed; see [LICENSE](LICENSE). Upstream libraries retain their licenses.
+## Contributing
 
+Bug reports, ideas and pull requests are welcome. Please run the checks under [Test](#test) before you submit and open an issue first for larger changes.
+
+## Licence
+
+fluxget is released under the [MIT License](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt). aria2 and yt-dlp are separate projects that you install yourself and keep their own licences.
+
+## Release and checksums
+
+<details>
+<summary>Direct downloads and how to verify them</summary>
+
+<br />
+
+The installer verifies checksums for you. If you download a package by hand, compare it with the values below. They are the same values published next to each archive on the release page, and they detect corruption but rely on the GitHub release as the trusted source.
+
+<!-- This block is rewritten by the release workflow (scripts/update_readme_release.py). Do not edit it by hand. -->
+<!-- release-info:start -->
+- **Latest release:** [fluxget 0.7.0](https://github.com/Cosmos-0118/fluxget/releases/tag/v0.7.0)
+- **Downloads and SHA-256 checksums:**
+
+  | Platform | File | SHA-256 |
+  | --- | --- | --- |
+  | Windows x86_64 (Intel/AMD) | [`fluxget-windows-x86_64.zip`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-windows-x86_64.zip) | `b8817c8bec17e0049280266641fe26dc811180af94bbdedca6a03bc0121b0ad1` |
+  | Windows aarch64 (ARM) | [`fluxget-windows-aarch64.zip`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-windows-aarch64.zip) | `f1e43b6f15a1c41e15900fb142df7320915c05fb748bfb6612742effd5af920b` |
+  | macOS x86_64 (Intel/AMD) | [`fluxget-macos-x86_64.tar.gz`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-macos-x86_64.tar.gz) | `3fdb3014bea8c629c07fe903dffff5b043a17df09db71ab9b8cebe5ed39912fc` |
+  | macOS x86_64 (Intel/AMD) | [`fluxget-macos-x86_64.zip`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-macos-x86_64.zip) | `9e05ef796d9e9aa488f2468d7541ef16ac81799ab29672f5b759e3ea939f2620` |
+  | macOS aarch64 (ARM) | [`fluxget-macos-aarch64.tar.gz`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-macos-aarch64.tar.gz) | `a5dc026e6ad2d98f279f7ee98ac88b9282852ced06f32d3a6b3b2b875f1fd775` |
+  | macOS aarch64 (ARM) | [`fluxget-macos-aarch64.zip`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-macos-aarch64.zip) | `1f76761f31fda1b8a697239f94fe7275775571c391fa2ac4eed452601b56e10e` |
+  | Linux x86_64 (Intel/AMD) | [`fluxget-linux-x86_64.tar.gz`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-linux-x86_64.tar.gz) | `673be06ffa551b888efc492c4661cbb38af20ff2688ab903dc467a2276279faa` |
+  | Linux x86_64 (Intel/AMD) | [`fluxget-linux-x86_64.zip`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-linux-x86_64.zip) | `081b43eeadc3a4b34a2de165fcaff00500197d950d4cbdeefa550f8346a01340` |
+  | Linux aarch64 (ARM) | [`fluxget-linux-aarch64.tar.gz`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-linux-aarch64.tar.gz) | `fca97a0081676845aebf5713ac589f08fe5d279ef321e133ba23aceb0b2da7a1` |
+  | Linux aarch64 (ARM) | [`fluxget-linux-aarch64.zip`](https://github.com/Cosmos-0118/fluxget/releases/download/v0.7.0/fluxget-linux-aarch64.zip) | `7c7113547c59f40977f7bf01f0a57e9f6d141cfb7ead6110ecd25c1d4b39abb1` |
+
+  Every archive also has a `.sha256` file on the release page.
+
+- **Verify locally** (run it in the folder you downloaded to):
+
+  ```sh
+  echo '3fdb3014bea8c629c07fe903dffff5b043a17df09db71ab9b8cebe5ed39912fc  fluxget-macos-x86_64.tar.gz' | shasum -a 256 -c
+  ```
+
+  On Windows, PowerShell prints `True` when the file is genuine:
+
+  ```powershell
+  (Get-FileHash .\fluxget-windows-x86_64.zip -Algorithm SHA256).Hash -eq 'b8817c8bec17e0049280266641fe26dc811180af94bbdedca6a03bc0121b0ad1'
+  ```
+<!-- release-info:end -->
+
+</details>
+
+---
+
+<div align="center">
+<sub>Made as a hobby project. If fluxget saves you time, a star helps others find it.</sub>
+</div>

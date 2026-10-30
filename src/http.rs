@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use url::Url;
 
@@ -18,17 +18,30 @@ use url::Url;
 /// in resolver order, so one unreachable CDN node listed first costs seconds
 /// on every new connection. Race the addresses once per host and hand back the
 /// ones that answered first.
+///
+/// The answer is remembered only briefly: after a switch from Wi-Fi to a hotspot or a VPN
+/// the old addresses may no longer be reachable.
 #[derive(Default)]
 struct Resolver {
-    known: Arc<Mutex<HashMap<String, Vec<SocketAddr>>>>,
+    known: Arc<Mutex<HashMap<String, Answer>>>,
 }
+
+/// When a host was resolved and where it answered.
+type Answer = (Instant, Vec<SocketAddr>);
+
+const RESOLVE_TTL: Duration = Duration::from_secs(60);
 
 impl Resolve for Resolver {
     fn resolve(&self, name: Name) -> Resolving {
         let known = self.known.clone();
         Box::pin(async move {
             let host = name.as_str().to_owned();
-            let cached = known.lock().ok().and_then(|k| k.get(&host).cloned());
+            let cached = known
+                .lock()
+                .ok()
+                .and_then(|k| k.get(&host).cloned())
+                .filter(|(when, _)| when.elapsed() < RESOLVE_TTL)
+                .map(|(_, addrs)| addrs);
             let addrs = match cached {
                 Some(addrs) => addrs,
                 None => {
@@ -36,7 +49,7 @@ impl Resolve for Resolver {
                         tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
                     let ordered = live_first(found, &[443, 80]).await;
                     if let Ok(mut k) = known.lock() {
-                        k.insert(host, ordered.clone());
+                        k.insert(host, (Instant::now(), ordered.clone()));
                     }
                     ordered
                 }
@@ -173,7 +186,14 @@ pub fn client(options: &Network) -> Result<Client> {
         .redirect(redirect)
         .dns_resolver(Arc::new(Resolver::default()))
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(options.timeout))
+        // Idle time, not total time: a long transfer that keeps receiving data is never cut off,
+        // while a connection that goes silent is noticed and retried.
+        .read_timeout(Duration::from_secs(options.timeout))
+        // Notice a dead socket (a lost Wi-Fi link, a sleeping laptop) before the idle timeout does.
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
         .pool_max_idle_per_host(32);
     if let Some(proxy) = &options.proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
@@ -234,7 +254,53 @@ pub fn retry_delay(response: &Response, attempt: u8) -> Duration {
             return date.duration_since(SystemTime::now()).unwrap_or_default();
         }
     }
-    Duration::from_millis(250 * (1u64 << attempt.min(8)))
+    backoff(attempt)
+}
+
+/// Exponential backoff from 250 ms, capped at 30 s, with up to a quarter added at random so
+/// that workers which failed together do not all retry at the same instant.
+pub fn backoff(attempt: u8) -> Duration {
+    let base = (250u64 << attempt.min(7)).min(30_000);
+    let noise = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    Duration::from_millis(base + noise % (base / 4 + 1))
+}
+
+/// A failure of the network or the server rather than of the request: the same request may
+/// well succeed later. Everything else (4xx answers, a changed file, a wrong range) is final.
+#[derive(Debug)]
+pub struct Transient(pub String);
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Transient {}
+
+/// Whether `error` came from a dropped, refused, timed-out or truncated connection, or from a
+/// server that kept answering with a temporary failure.
+pub fn transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<Transient>()
+            || cause.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+                e.is_connect()
+                    || e.is_timeout()
+                    || e.is_body()
+                    || e.is_request()
+                    || e.status().is_some_and(retryable)
+            })
+    })
+}
+
+/// Statuses that usually clear up on their own.
+fn retryable(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        408 | 429 | 500 | 502 | 503 | 504 | 520..=524
+    )
 }
 
 pub async fn request(builder: reqwest::RequestBuilder, retries: u8) -> Result<(Response, bool)> {
@@ -248,11 +314,7 @@ pub async fn request(builder: reqwest::RequestBuilder, retries: u8) -> Result<(R
         match result {
             Ok(response) => {
                 let status = response.status();
-                if status == StatusCode::TOO_MANY_REQUESTS
-                    || status == StatusCode::SERVICE_UNAVAILABLE
-                    || status == StatusCode::BAD_GATEWAY
-                    || status == StatusCode::GATEWAY_TIMEOUT
-                {
+                if retryable(status) {
                     throttled |= status == StatusCode::TOO_MANY_REQUESTS
                         || status == StatusCode::SERVICE_UNAVAILABLE;
                     if attempt < retries {
@@ -272,7 +334,7 @@ pub async fn request(builder: reqwest::RequestBuilder, retries: u8) -> Result<(R
                 return Ok((response.error_for_status()?, throttled));
             }
             Err(e) if attempt == retries => return Err(e.into()),
-            Err(_) => tokio::time::sleep(Duration::from_millis(250 * (1u64 << attempt))).await,
+            Err(_) => tokio::time::sleep(backoff(attempt)).await,
         }
     }
     bail!("Retry budget exhausted")
@@ -495,6 +557,29 @@ mod tests {
         assert_eq!(order, vec![live, silent]);
         assert!(started.elapsed() < Duration::from_millis(800));
         assert_eq!(live_first(vec![silent], &[port]).await, vec![silent]);
+    }
+    #[test]
+    fn backoff_grows_stays_capped_and_is_never_lockstep() {
+        for attempt in 0..=u8::MAX {
+            let wait = backoff(attempt);
+            let base = Duration::from_millis((250u64 << attempt.min(7)).min(30_000));
+            assert!(wait >= base && wait <= base + base / 4 + Duration::from_millis(1));
+        }
+        assert!(backoff(0) < Duration::from_millis(400));
+        assert!(backoff(30) <= Duration::from_millis(37_500));
+    }
+    #[test]
+    fn only_network_and_server_trouble_is_transient() {
+        let truncated: anyhow::Error = Transient("cut off".into()).into();
+        assert!(transient(&truncated));
+        assert!(transient(&truncated.context("while fetching a chunk")));
+        for status in [408u16, 429, 500, 502, 503, 504, 522] {
+            assert!(retryable(StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [301u16, 403, 404, 412, 416] {
+            assert!(!retryable(StatusCode::from_u16(status).unwrap()));
+        }
+        assert!(!transient(&anyhow::anyhow!("Remote file changed")));
     }
     #[test]
     fn pasted_hosts_get_a_scheme() {

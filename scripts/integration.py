@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import time
@@ -32,6 +33,10 @@ class Downloads(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.output = Path(self.temp.name) / "result.bin"
         self.server.version = 1
+        self.server.outage_until = 0.0
+        self.server.outage_requests = 0
+        self.server.truncated.clear()
+        self.server.seen.clear()
 
     def call(self, *args, success=True):
         result = subprocess.run([str(BINARY), *map(str, args)], capture_output=True, text=True, timeout=40)
@@ -122,6 +127,52 @@ class Downloads(unittest.TestCase):
         self.get("/truncate", "--chunk-kib", "1024")
         self.verify()
 
+    def test_truncated_chunk_continues_where_it_stopped(self):
+        self.get("/truncate", "--chunk-kib", "1024")
+        self.verify()
+        # The cut came after 1024 bytes, so the follow-up asked only for the rest of the chunk.
+        self.assertTrue(any(start % (1024 * 1024) == 1024 for route, start in self.server.seen if route == "/truncate"))
+
+    def test_idle_timeout_does_not_cap_total_time(self):
+        # 4 MiB at 1 MiB/s takes about four seconds, longer than --timeout 2: only silence counts.
+        self.get("/norange?size=4194304&cap=1", "--timeout", "2")
+        self.verify(4 * 1024 * 1024)
+
+    def test_outage_is_waited_out(self):
+        result = self.get("/outage?size=4194304&after=3&down=5", "--chunk-kib", "256", "-j", "2", "--retries", "1", "--timeout", "5", "--patience", "40")
+        self.verify(4 * 1024 * 1024)
+        self.assertIn("network unavailable", result.stderr)
+        self.assertIn("network is back", result.stderr)
+
+    def test_outage_longer_than_patience_keeps_progress_for_resume(self):
+        result = self.get("/outage?size=4194304&after=3&down=60", "--chunk-kib", "256", "-j", "2", "--retries", "1", "--timeout", "5", "--patience", "3", success=False)
+        self.assertIn("Network unavailable", result.stderr)
+        self.assertFalse(self.output.exists())
+        saved = json.loads(Path(str(self.output) + ".fluxget.json").read_text())["chunks"]
+        self.assertGreaterEqual(sum(c is not None for c in saved), 3)
+        self.server.outage_until = 0.0  # the network is back
+        result = json.loads(self.call("resume", self.output, "--json").stdout)
+        self.assertGreater(result["resumed_bytes"], 0)
+        self.verify(4 * 1024 * 1024)
+
+    def test_patience_zero_fails_at_the_first_exhausted_retry(self):
+        began = time.perf_counter()
+        self.get("/outage?size=4194304&after=3&down=60", "--chunk-kib", "256", "-j", "2", "--retries", "1", "--timeout", "5", "--patience", "0", success=False)
+        self.assertLess(time.perf_counter() - began, 15)
+
+    def test_part_without_checkpoint_is_restarted(self):
+        Path(str(self.output) + ".fluxget.part").write_bytes(b"left by a run that stopped before its first save")
+        self.get("/file.bin", "--chunk-kib", "64")
+        self.verify()
+
+    def test_checkpoint_left_after_publishing_is_cleaned_up(self):
+        self.get()
+        stale = Path(str(self.output) + ".fluxget.json")
+        stale.write_text("{}")
+        self.get(success=False)
+        self.assertFalse(stale.exists())
+        self.verify()
+
     def test_permanent_truncation_rejected(self):
         self.get("/always-truncate", "--retries", "0", success=False)
         self.assertFalse(self.output.exists())
@@ -176,7 +227,8 @@ class Downloads(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.call(self.server.url + "/ambiguous", "--select", "3", "-o", self.output, "--json", success=False)
 
-    def interrupt(self):
+    def interrupt(self, stop=None):
+        """Stops a download after a few chunks are saved: killed, or sent `stop` and left to react."""
         url = self.server.url + "/file.bin?size=8388608&cap=2"
         process = subprocess.Popen([str(BINARY), url, "-o", str(self.output), "--direct", "--chunk-kib", "256", "-j", "1", "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         cp_path = Path(str(self.output) + ".fluxget.json")
@@ -194,8 +246,12 @@ class Downloads(unittest.TestCase):
             else:
                 self.fail("No checkpoint committed within 15 seconds")
         finally:
-            process.kill()
-            process.communicate(timeout=5)
+            if stop is None:
+                process.kill()
+            else:
+                process.send_signal(stop)
+            self.stopped = process.communicate(timeout=10)
+            self.exit_code = process.returncode
         return cp_path
 
     def test_kill_resume_and_corruption_repair(self):
@@ -209,6 +265,20 @@ class Downloads(unittest.TestCase):
         self.assertGreater(result["resumed_bytes"], 0)
         self.assertLess(result["resumed_bytes"], 8 * 1024 * 1024)
         self.verify(8 * 1024 * 1024)
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals")
+    def test_sigterm_and_hangup_save_progress_and_resume(self):
+        for stop in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=stop.name):
+                self.output.unlink(missing_ok=True)
+                cp_path = self.interrupt(stop)
+                self.assertNotEqual(self.exit_code, 0)
+                self.assertIn("Interrupted", self.stopped[1].decode())
+                saved = sum(c is not None for c in json.loads(cp_path.read_text())["chunks"])
+                self.assertGreaterEqual(saved, 3)
+                result = json.loads(self.call("resume", self.output, "--json").stdout)
+                self.assertGreater(result["resumed_bytes"], 0)
+                self.verify(8 * 1024 * 1024)
 
     def test_changed_remote_refuses_resume(self):
         self.interrupt()

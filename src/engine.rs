@@ -1,6 +1,6 @@
 use crate::{
-    http::{self, Info},
-    paused,
+    http::{self, Info, Transient},
+    paused, shutdown,
     state::{self, Checkpoint},
     ui::{self, Telemetry},
     Tuning,
@@ -9,7 +9,7 @@ use anyhow::{bail, ensure, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -116,6 +116,12 @@ impl Controller {
     }
 }
 
+/// A chunk attempt that delivered at least this much does not use up the retry budget, so a
+/// flaky link that keeps dropping a large chunk still gets it through.
+const PROGRESS_BYTES: usize = 64 * 1024;
+
+type Fetched = (usize, Result<(Vec<u8>, bool)>);
+
 async fn fetch_chunk(
     client: Client,
     info: Info,
@@ -123,65 +129,97 @@ async fn fetch_chunk(
     chunk_size: u64,
     retries: u8,
     telemetry: Arc<Telemetry>,
-) -> Result<(usize, Vec<u8>, bool)> {
+) -> Fetched {
+    let result = fetch(&client, &info, index, chunk_size, retries, &telemetry).await;
+    (index, result)
+}
+
+async fn fetch(
+    client: &Client,
+    info: &Info,
+    index: usize,
+    chunk_size: u64,
+    retries: u8,
+    telemetry: &Arc<Telemetry>,
+) -> Result<(Vec<u8>, bool)> {
     let size = info.size.context("Range download requires size")?;
     let start = index as u64 * chunk_size;
     let end = (size - start).min(chunk_size) + start - 1;
     let expected = (end - start + 1) as usize;
     let received = telemetry.received.clone();
     let lane = telemetry.begin_lane(index, expected as u64);
+    // A strong ETag or Last-Modified makes the server refuse a file that changed, so after a
+    // dropped connection the rest of the chunk is requested and joined to what already
+    // arrived. Without either guard the chunk is fetched again whole.
+    let splice = info.etag.is_some() || info.last_modified.is_some();
+    let mut data: Vec<u8> = Vec::with_capacity(expected);
     let mut throttled = false;
-    for attempt in 0..=retries {
-        lane.lane.done.store(0, Ordering::Relaxed);
+    let mut attempt = 0u8;
+    loop {
+        let from = start + data.len() as u64;
+        let before = data.len();
+        lane.lane.done.store(before as u64, Ordering::Relaxed);
         let builder = info.guard(
             client
                 .get(&info.url)
-                .header("range", format!("bytes={start}-{end}")),
+                .header("range", format!("bytes={from}-{end}")),
         );
-        // Header-level retries respect Retry-After. Body failures replay only this chunk.
-        let (mut response, was_throttled) = http::request(builder, retries).await?;
-        throttled |= was_throttled;
-        ensure!(response.status() == StatusCode::PARTIAL_CONTENT, "Server stopped honoring ranges; partial data retained. Retry with a new output and --single-stream");
-        http::identity(&response)?;
-        ensure!(
-            http::range(
-                http::header(&response, "content-range").context("Missing Content-Range")?
-            )? == (start, end, size),
-            "Server returned the wrong Content-Range"
-        );
-        info.unchanged(&response)?;
-        let mut data = Vec::with_capacity(expected);
-        let mut body_error = None;
-        loop {
-            match response.chunk().await {
-                Ok(Some(bytes)) => {
-                    ensure!(
-                        data.len() + bytes.len() <= expected,
-                        "Range body exceeds requested size"
-                    );
-                    data.extend_from_slice(&bytes);
-                    received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    lane.lane
-                        .done
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    body_error = Some(e);
-                    break;
+        // Header-level retries respect Retry-After. Body failures continue this chunk.
+        let outcome: Result<Option<String>> = async {
+            let (mut response, was_throttled) = http::request(builder, retries).await?;
+            throttled |= was_throttled;
+            ensure!(response.status() == StatusCode::PARTIAL_CONTENT, "Server stopped honoring ranges; partial data retained. Retry with a new output and --single-stream");
+            http::identity(&response)?;
+            ensure!(
+                http::range(
+                    http::header(&response, "content-range").context("Missing Content-Range")?
+                )? == (from, end, size),
+                "Server returned the wrong Content-Range"
+            );
+            info.unchanged(&response)?;
+            loop {
+                match response.chunk().await {
+                    Ok(Some(bytes)) => {
+                        ensure!(
+                            data.len() + bytes.len() <= expected,
+                            "Range body exceeds requested size"
+                        );
+                        data.extend_from_slice(&bytes);
+                        let count = bytes.len() as u64;
+                        received.fetch_add(count, Ordering::Relaxed);
+                        telemetry.activity.fetch_add(count, Ordering::Relaxed);
+                        lane.lane.done.fetch_add(count, Ordering::Relaxed);
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(e) => return Ok(Some(e.to_string())),
                 }
             }
         }
-        if body_error.is_none() && data.len() == expected {
-            return Ok((index, data, throttled));
+        .await;
+        let reason = outcome?;
+        if data.len() == expected {
+            return Ok((data, throttled));
         }
-        received.fetch_sub(data.len() as u64, Ordering::Relaxed);
-        if attempt == retries {
-            bail!("Range {start}-{end} truncated after retries ({} of {expected} bytes): {body_error:?}", data.len());
+        let gained = data.len() - before;
+        let have = data.len();
+        if splice {
+            if gained >= PROGRESS_BYTES {
+                attempt = 0;
+            }
+        } else {
+            received.fetch_sub(have as u64, Ordering::Relaxed);
+            data.clear();
         }
-        tokio::time::sleep(Duration::from_millis(250 * (1u64 << attempt))).await;
+        if attempt >= retries {
+            return Err(Transient(format!(
+                "Range {start}-{end} truncated after retries ({have} of {expected} bytes): {}",
+                reason.as_deref().unwrap_or("body ended early")
+            ))
+            .into());
+        }
+        tokio::time::sleep(http::backoff(attempt)).await;
+        attempt += 1;
     }
-    unreachable!()
 }
 
 fn checkpoint(info: &Info, expected: Option<String>, chunk_size: u64) -> Result<Checkpoint> {
@@ -226,6 +264,62 @@ async fn segmented(
             telemetry.mark(index, ui::DONE);
         }
     }
+    // Chunks written but not yet synced; the journal only claims synced data.
+    let mut unsynced: Vec<(usize, String)> = Vec::new();
+    let outcome = transfer(
+        client,
+        info,
+        file,
+        checkpoint_path,
+        state,
+        tuning,
+        telemetry,
+        &mut unsynced,
+    )
+    .await;
+    // However the transfer ended (finished, interrupted, failed, disk full), record what has
+    // already reached the disk. A failure here is secondary to the one being reported.
+    let flushed = flush(file, checkpoint_path, state, &mut unsynced);
+    let controller = outcome?;
+    flushed?;
+    if info.etag.is_none() {
+        spot_check(client, info, file, &spans(state)).await?;
+    }
+    Ok((resumed, controller))
+}
+
+/// Time without a single byte from any worker after which a failing chunk is blamed on the
+/// network rather than on the chunk.
+const QUIET_AFTER: Duration = Duration::from_secs(2);
+/// Longest pause between probe requests while the network is down.
+const PROBE_CAP: Duration = Duration::from_secs(15);
+
+/// The network is down: one worker probes now and then while the rest wait.
+struct Outage {
+    failures: u8,
+    next_probe: Instant,
+}
+
+/// How many requests may run now and how often each retries.
+fn allowance(controller: &Controller, outage: &Option<Outage>, retries: u8) -> (usize, u8) {
+    match outage {
+        None => (controller.target, retries),
+        Some(o) if Instant::now() >= o.next_probe => (1, 0),
+        Some(_) => (0, 0),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn transfer(
+    client: &Client,
+    info: &Info,
+    file: &mut File,
+    checkpoint_path: &Path,
+    state: &mut Checkpoint,
+    tuning: &Tuning,
+    telemetry: &Arc<Telemetry>,
+    unsynced: &mut Vec<(usize, String)>,
+) -> Result<Controller> {
     let mut queue: VecDeque<usize> = state
         .chunks
         .iter()
@@ -239,25 +333,24 @@ async fn segmented(
     let mut sample_bytes = 0u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Chunks written but not yet synced; the journal only claims synced data.
-    let mut unsynced: Vec<(usize, String)> = Vec::new();
     let mut last_flush = Instant::now();
-    let cancel = tokio::signal::ctrl_c();
-    tokio::pin!(cancel);
+    let patience = Duration::from_secs(tuning.patience);
+    // When any worker last received data, and the byte count seen when a chunk last failed.
+    let mut seen_activity = 0u64;
+    let mut last_progress = Instant::now();
+    let mut strikes: HashMap<usize, u64> = HashMap::new();
+    let mut outage: Option<Outage> = None;
+    // Progress is drawn on a terminal; scripts get one plain line per outage instead.
+    let notify = !tuning.quiet && (tuning.json || !dialoguer::console::Term::stderr().is_term());
+    let stop = shutdown::requested();
+    tokio::pin!(stop);
     while !queue.is_empty() || !tasks.is_empty() {
+        let (limit, retries) = allowance(&controller, &outage, tuning.retries);
         refill(
-            &mut tasks,
-            &mut queue,
-            &controller,
-            client,
-            info,
-            state,
-            tuning,
-            telemetry,
+            &mut tasks, &mut queue, limit, retries, client, info, state, telemetry,
         );
         tokio::select! {
-            _ = &mut cancel => {
-                flush(file, checkpoint_path, state, &mut unsynced)?;
+            _ = &mut stop => {
                 bail!("Interrupted; run 'fluxget resume <output>' to continue")
             }
             _ = ticker.tick() => {
@@ -267,30 +360,85 @@ async fn segmented(
                 sample_bytes = seen;
                 sample_start = Instant::now();
                 telemetry.workers.store(controller.target, Ordering::Relaxed);
+                let activity = telemetry.activity.load(Ordering::Relaxed);
+                if activity != seen_activity {
+                    seen_activity = activity;
+                    last_progress = Instant::now();
+                }
+                let waited = last_progress.elapsed();
+                telemetry.waiting.store(
+                    if outage.is_some() { waited.as_secs().max(1) } else { 0 },
+                    Ordering::Relaxed,
+                );
+                if outage.is_some() && waited > patience {
+                    bail!(
+                        "Network unavailable for {}s; progress is saved, run 'fluxget resume <output>' once it is back",
+                        waited.as_secs()
+                    );
+                }
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
-                let (index, bytes, throttled) = result.context("No worker result")?? ?;
+                let (index, fetched) = result.context("No worker result")??;
+                let (bytes, throttled) = match fetched {
+                    Ok(done) => done,
+                    Err(error) => {
+                        if tuning.patience == 0 || !http::transient(&error) {
+                            return Err(error);
+                        }
+                        let quiet = last_progress.elapsed();
+                        if quiet < QUIET_AFTER {
+                            // Data is still arriving, or the outage only just began. A chunk
+                            // that fails again after data came in is at fault, not the network.
+                            let now = telemetry.activity.load(Ordering::Relaxed);
+                            if strikes.insert(index, now).is_some_and(|before| before != now) {
+                                return Err(error);
+                            }
+                        } else if quiet > patience {
+                            return Err(error.context(format!(
+                                "Network unavailable for {}s; progress is saved, run 'fluxget resume <output>' once it is back",
+                                quiet.as_secs()
+                            )));
+                        } else {
+                            let down = outage.get_or_insert_with(|| {
+                                if notify {
+                                    eprintln!("fluxget: network unavailable ({error:#}); waiting up to {}s for it to return", tuning.patience);
+                                }
+                                Outage { failures: 0, next_probe: Instant::now() }
+                            });
+                            down.next_probe = Instant::now()
+                                + http::backoff(down.failures).min(PROBE_CAP);
+                            down.failures = down.failures.saturating_add(1);
+                        }
+                        queue.push_front(index);
+                        continue;
+                    }
+                };
+                if outage.take().is_some() {
+                    telemetry.waiting.store(0, Ordering::Relaxed);
+                    if notify {
+                        eprintln!("fluxget: network is back; continuing");
+                    }
+                }
+                strikes.remove(&index);
+                last_progress = Instant::now();
                 if throttled {
                     controller.throttled();
                 }
                 // Start the replacement request before touching the disk.
-                refill(&mut tasks, &mut queue, &controller, client, info, state, tuning, telemetry);
+                let (limit, retries) = allowance(&controller, &outage, tuning.retries);
+                refill(&mut tasks, &mut queue, limit, retries, client, info, state, telemetry);
                 file.seek(SeekFrom::Start(index as u64 * state.chunk_size))?;
                 file.write_all(&bytes)?;
                 unsynced.push((index, state::hash(&bytes)));
                 telemetry.mark(index, ui::DONE);
                 if last_flush.elapsed() >= Duration::from_secs(1) {
-                    flush(file, checkpoint_path, state, &mut unsynced)?;
+                    flush(file, checkpoint_path, state, unsynced)?;
                     last_flush = Instant::now();
                 }
             }
         }
     }
-    flush(file, checkpoint_path, state, &mut unsynced)?;
-    if info.etag.is_none() {
-        spot_check(client, info, file, &spans(state)).await?;
-    }
-    Ok((resumed, controller))
+    Ok(controller)
 }
 
 /// Bytes compared per span when the server has no strong validator.
@@ -389,16 +537,16 @@ fn flush(
 
 #[allow(clippy::too_many_arguments)]
 fn refill(
-    tasks: &mut JoinSet<Result<(usize, Vec<u8>, bool)>>,
+    tasks: &mut JoinSet<Fetched>,
     queue: &mut VecDeque<usize>,
-    controller: &Controller,
+    limit: usize,
+    retries: u8,
     client: &Client,
     info: &Info,
     state: &Checkpoint,
-    tuning: &Tuning,
     telemetry: &Arc<Telemetry>,
 ) {
-    while tasks.len() < controller.target {
+    while tasks.len() < limit {
         let Some(index) = queue.pop_front() else {
             break;
         };
@@ -407,7 +555,7 @@ fn refill(
             info.clone(),
             index,
             state.chunk_size,
-            tuning.retries,
+            retries,
             telemetry.clone(),
         ));
     }
@@ -420,59 +568,102 @@ async fn single(
     tuning: &Tuning,
     telemetry: &Arc<Telemetry>,
 ) -> Result<u64> {
-    let cancel = tokio::signal::ctrl_c();
-    tokio::pin!(cancel);
-    for attempt in 0..=tuning.retries {
+    const INTERRUPTED: &str = "Interrupted; this server requires a fresh single-stream transfer";
+    let stop = shutdown::requested();
+    tokio::pin!(stop);
+    let mut attempt = 0u8;
+    // Set while attempts fail before receiving anything, which means the network is down.
+    let mut down_since: Option<Instant> = None;
+    loop {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         telemetry.received.store(0, Ordering::Relaxed);
-        let builder = info.guard(client.get(&info.url));
-        let (mut response, _) = tokio::select! {
-            _ = &mut cancel => bail!("Interrupted; this server requires a fresh single-stream transfer"),
-            result = http::request(builder, tuning.retries) => result?,
-        };
-        ensure!(
-            response.status() == StatusCode::OK,
-            "Unexpected single-stream status {}",
-            response.status()
-        );
-        http::identity(&response)?;
-        info.unchanged(&response)?;
         let mut count = 0u64;
-        let mut failure = None;
-        loop {
-            let next = tokio::select! {
-                _ = &mut cancel => bail!("Interrupted; this server requires a fresh single-stream transfer"),
-                result = response.chunk() => result,
-            };
-            match next {
-                Ok(Some(bytes)) => {
-                    count += bytes.len() as u64;
-                    ensure!(
-                        info.size.is_none_or(|size| count <= size),
-                        "Response exceeds probed size"
-                    );
-                    file.write_all(&bytes)?;
-                    telemetry
-                        .received
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
+        let outcome = tokio::select! {
+            _ = &mut stop => bail!(INTERRUPTED),
+            outcome = single_attempt(client, info, file, tuning.retries, telemetry, &mut count) => outcome,
+        };
+        let error = match outcome {
+            Ok(()) => return Ok(count),
+            Err(error) => error,
+        };
+        if !http::transient(&error) {
+            return Err(error);
+        }
+        if count > 0 {
+            down_since = None;
+        } else {
+            down_since.get_or_insert_with(Instant::now);
+        }
+        if attempt >= tuning.retries {
+            // A transfer cannot continue where it stopped, so only an unreachable network
+            // earns extra waiting; a response that breaks off partway does not.
+            let patient = tuning.patience > 0
+                && count == 0
+                && down_since.is_some_and(|t| t.elapsed() < Duration::from_secs(tuning.patience));
+            if !patient {
+                return Err(error);
             }
         }
-        if failure.is_none() && info.size.is_none_or(|size| size == count) {
-            return Ok(count);
+        let pause = http::backoff(attempt.min(6)).min(PROBE_CAP);
+        attempt = attempt.saturating_add(1);
+        tokio::select! {
+            _ = &mut stop => bail!(INTERRUPTED),
+            _ = tokio::time::sleep(pause) => {}
         }
-        if attempt == tuning.retries {
-            bail!("Single stream truncated after retries: {failure:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(250 * (1u64 << attempt))).await;
     }
-    unreachable!()
+}
+
+/// One whole-file request. `count` reports how many bytes arrived, even when it fails.
+async fn single_attempt(
+    client: &Client,
+    info: &Info,
+    file: &mut File,
+    retries: u8,
+    telemetry: &Arc<Telemetry>,
+    count: &mut u64,
+) -> Result<()> {
+    let builder = info.guard(client.get(&info.url));
+    let (mut response, _) = http::request(builder, retries).await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "Unexpected single-stream status {}",
+        response.status()
+    );
+    http::identity(&response)?;
+    info.unchanged(&response)?;
+    loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                *count += bytes.len() as u64;
+                ensure!(
+                    info.size.is_none_or(|size| *count <= size),
+                    "Response exceeds probed size"
+                );
+                file.write_all(&bytes)?;
+                telemetry
+                    .received
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                telemetry
+                    .activity
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(
+                    Transient(format!("Single stream broke after {count} bytes: {e}")).into(),
+                )
+            }
+        }
+    }
+    if info.size.is_some_and(|size| size != *count) {
+        return Err(Transient(format!(
+            "Single stream ended after {count} of {} bytes",
+            info.size.unwrap_or_default()
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn publish(part: &Path, output: &Path, force: bool) -> Result<()> {
@@ -501,6 +692,18 @@ pub async fn download(
     force: bool,
     tuning: &Tuning,
 ) -> Result<()> {
+    shutdown::install();
+    let part = state::sidecar(&output, ".fluxget.part");
+    let checkpoint_path = state::sidecar(&output, ".fluxget.json");
+    // A run stopped after publishing but before tidying up leaves its checkpoint behind.
+    if output.exists() && !part.exists() && checkpoint_path.exists() {
+        if let Ok(held) = state::lock(&output) {
+            let _ = fs::remove_file(&checkpoint_path);
+            paused::forget(&output);
+            drop(held);
+            let _ = fs::remove_file(state::sidecar(&output, ".fluxget.lock"));
+        }
+    }
     ensure!(
         !output.exists() || force,
         "Output already exists; choose another -o path or use --force"
@@ -511,8 +714,6 @@ pub async fn download(
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let lock = state::lock(&output)?;
-    let part = state::sidecar(&output, ".fluxget.part");
-    let checkpoint_path = state::sidecar(&output, ".fluxget.json");
     // Ranges need a verified length. Every ranged request carries the strongest precondition
     // the server offers (ETag, then Last-Modified); a server that offers neither is spot-checked.
     let use_ranges = !tuning.single_stream && info.ranges && info.size.is_some_and(|n| n > 0);
@@ -526,10 +727,11 @@ pub async fn download(
         );
         Some(loaded)
     } else if use_ranges {
-        ensure!(
-            !part.exists(),
-            "Untracked partial file exists; move/delete it before restarting"
-        );
+        // No checkpoint means no verified bytes. Whatever this file holds comes from a run that
+        // stopped before its first save, or from a single-stream transfer, and cannot be used.
+        if part.exists() {
+            fs::remove_file(&part)?;
+        }
         Some(checkpoint(
             &info,
             expected.clone(),
@@ -674,6 +876,7 @@ mod tests {
             single_stream: false,
             chunk_kib: 2048,
             retries: 4,
+            patience: 300,
             json: false,
             quiet: true,
         }
